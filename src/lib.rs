@@ -37,8 +37,13 @@ pub use types::{
     NetworkPrivacyOptions, NoteSplitProposal, PreparedTx, TransferProposal, TransferResult,
 };
 
-// ----- backend modules (added during backend bring-up, gated on the feature) -----
-// #[cfg(feature = "librustzcash-backend")] mod backend;
-// #[cfg(feature = "librustzcash-backend")] mod context;
-// #[cfg(feature = "librustzcash-backend")] mod reserved_source;
-// #[cfg(feature = "librustzcash-backend")] pub use context::MigrationContext;
+// ----- backend modules (valargroup librustzcash; gated on the feature) -----
+#[cfg(feature = "librustzcash-backend")]
+mod backend;
+#[cfg(feature = "librustzcash-backend")]
+mod context;
+#[cfg(feature = "librustzcash-backend")]
+mod reserved_source;
+
+#[cfg(feature = "librustzcash-backend")]
+pub use context::MigrationContext;

@@ -7,19 +7,43 @@ description = "Shared Orchard→Ironwood wallet migration engine (ported from vi
 repository = "https://github.com/ZODL/ZODLIronwoodMigrationRust"
 
 [features]
-# During the core-TDD phase the default is empty so `cargo build` / `cargo test`
-# exercise only the lightweight, valargroup-free core (fast, no git fetch).
-# The backend bring-up step flips the default to ["librustzcash-backend"] and
-# populates that feature with the real valargroup dependency activations.
-default = []
-librustzcash-backend = []
+# The valargroup-backed integration (the ReservedInputSource adapter, the propose/sign/balance
+# calls, and the MigrationContext facade) is on by default. Building/testing the lightweight
+# core in isolation is `cargo test --no-default-features` (fast, no git fetch).
+default = ["librustzcash-backend"]
+librustzcash-backend = [
+    "dep:zcash_client_backend",
+    "dep:zcash_client_sqlite",
+    "dep:zcash_primitives",
+    "dep:zcash_keys",
+    "dep:zcash_protocol",
+    "dep:zcash_proofs",
+    "dep:orchard",
+]
 
 [dependencies]
+# ----- core (always compiled, valargroup-free) -----
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# MUST single-version with zcash_client_sqlite 0.21 (which pins rusqlite 0.37).
+# MUST single-version with the librustzcash workspace (rusqlite 0.37 + bundled) so there is one
+# rusqlite and one bundled libsqlite3-sys across the whole build.
 rusqlite = { version = "0.37", features = ["bundled"] }
 hex = "0.4"
+
+# ----- backend (optional): the valargroup librustzcash fork -----
+# All librustzcash crates are pinned by rev (reproducible); they share one git source so they
+# unify. orchard is pinned by the SAME branch spec the valargroup workspace uses
+# (`orchard.workspace = true` -> branch), so the direct dep and the transitive dep resolve to a
+# single orchard (a `rev` spec would not unify with the workspace's `branch` spec).
+# The Ironwood APIs are gated `#[cfg(zcash_unstable = "nu6.3")]`; the cfg is set in
+# .cargo/config.toml. `unstable` exposes the `proposed_version` parameter used to force V6.
+zcash_client_backend = { version = "0.23", git = "https://github.com/valargroup/librustzcash", rev = "0c3ad735f8402295fccb9acf2fe897779500bbf5", features = ["orchard", "transparent-inputs", "unstable"], optional = true }
+zcash_client_sqlite = { version = "0.21", git = "https://github.com/valargroup/librustzcash", rev = "0c3ad735f8402295fccb9acf2fe897779500bbf5", features = ["orchard", "transparent-inputs", "unstable", "serde"], optional = true }
+zcash_primitives = { version = "0.28", git = "https://github.com/valargroup/librustzcash", rev = "0c3ad735f8402295fccb9acf2fe897779500bbf5", optional = true }
+zcash_keys = { version = "0.14", git = "https://github.com/valargroup/librustzcash", rev = "0c3ad735f8402295fccb9acf2fe897779500bbf5", features = ["orchard"], optional = true }
+zcash_protocol = { version = "0.9", git = "https://github.com/valargroup/librustzcash", rev = "0c3ad735f8402295fccb9acf2fe897779500bbf5", optional = true }
+zcash_proofs = { version = "0.28", git = "https://github.com/valargroup/librustzcash", rev = "0c3ad735f8402295fccb9acf2fe897779500bbf5", optional = true }
+orchard = { version = "0.14", git = "https://github.com/zcash/orchard", branch = "adam/qleak-dummy-ciphertexts-on-pr505", default-features = false, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
