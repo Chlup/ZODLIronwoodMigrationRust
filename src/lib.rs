@@ -27,10 +27,15 @@ pub mod error;
 pub mod types;
 
 mod denominations;
-mod network;
 mod scheduling;
 mod state;
 mod store;
+
+pub use error::MigrationError;
+pub use types::{
+    AttentionReason, MigrationProgress, MigrationSchedule, MigrationState, Network,
+    NetworkPrivacyOptions, NoteSplitProposal, PreparedTx, TransferProposal, TransferResult,
+};
 
 // ----- backend modules (added during backend bring-up, gated on the feature) -----
 // #[cfg(feature = "librustzcash-backend")] mod backend;
