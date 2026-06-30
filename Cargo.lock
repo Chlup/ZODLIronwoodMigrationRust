@@ -2467,6 +2467,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "uuid",
+ "zcash_address",
  "zcash_client_backend",
  "zcash_client_sqlite",
  "zcash_keys",

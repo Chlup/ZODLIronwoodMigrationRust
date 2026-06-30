@@ -17,6 +17,7 @@ librustzcash-backend = [
     "dep:zcash_primitives",
     "dep:zcash_keys",
     "dep:zcash_protocol",
+    "dep:zcash_address",
     "dep:zcash_proofs",
     "dep:zcash_transparent",
     "dep:zip321",
@@ -50,6 +51,7 @@ zcash_client_sqlite = { version = "0.21", git = "https://github.com/valargroup/l
 zcash_primitives = { version = "0.28", git = "https://github.com/valargroup/librustzcash", rev = "0c3ad735f8402295fccb9acf2fe897779500bbf5", optional = true }
 zcash_keys = { version = "0.14", git = "https://github.com/valargroup/librustzcash", rev = "0c3ad735f8402295fccb9acf2fe897779500bbf5", features = ["orchard"], optional = true }
 zcash_protocol = { version = "0.9", git = "https://github.com/valargroup/librustzcash", rev = "0c3ad735f8402295fccb9acf2fe897779500bbf5", optional = true }
+zcash_address = { version = "0.12", git = "https://github.com/valargroup/librustzcash", rev = "0c3ad735f8402295fccb9acf2fe897779500bbf5", optional = true }
 zcash_transparent = { version = "0.8", git = "https://github.com/valargroup/librustzcash", rev = "0c3ad735f8402295fccb9acf2fe897779500bbf5", optional = true }
 zip321 = { version = "0.8", git = "https://github.com/valargroup/librustzcash", rev = "0c3ad735f8402295fccb9acf2fe897779500bbf5", optional = true }
 zcash_proofs = { version = "0.28", git = "https://github.com/valargroup/librustzcash", rev = "0c3ad735f8402295fccb9acf2fe897779500bbf5", optional = true }

@@ -11,12 +11,14 @@
 
 use rand::rngs::OsRng;
 use uuid::Uuid;
+use zcash_address::ZcashAddress;
 use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
 use zcash_client_backend::data_api::WalletRead;
 use zcash_client_sqlite::util::SystemClock;
 use zcash_client_sqlite::{AccountUuid, WalletDb};
-use zcash_keys::keys::{Era, UnifiedSpendingKey};
-use zcash_protocol::consensus::{self, BlockHeight};
+use zcash_keys::keys::{Era, UnifiedAddressRequest, UnifiedSpendingKey};
+use zcash_protocol::consensus::{self, BlockHeight, Parameters};
+use zcash_protocol::value::Zatoshis;
 
 use crate::error::MigrationError;
 use crate::types::Network;
@@ -99,7 +101,7 @@ use zcash_client_sqlite::ReceivedNoteId;
 use zcash_primitives::transaction::fees::zip317::FeeRule as Zip317FeeRule;
 use zcash_primitives::transaction::{TxId, TxVersion};
 use zcash_protocol::ShieldedProtocol;
-use zip321::TransactionRequest;
+use zip321::{Payment, TransactionRequest};
 
 use crate::reserved_source::ReservedInputSource;
 use crate::store;
@@ -183,18 +185,38 @@ pub(crate) fn sign_proposal(
     Ok(SignedTx { txid, raw_tx })
 }
 
-/// Build a zip321 request paying `amount` to the account's own unified address (Ironwood addresses
-/// equal the existing Orchard/unified address, so the migration is a self-send). Resolving the
-/// account's address and constructing the payment against a live wallet is the remaining
-/// integration step — every caller below is otherwise complete.
-fn self_payment_request(
-    _db: &Db,
-    _account: AccountUuid,
-    _amount: u64,
+/// Build a zip321 request paying `amount` zatoshi to `address`. Pure (no DB/network access) so it
+/// is directly unit-tested; the migration is a self-send, so `address` is the account's own
+/// unified address resolved by [`self_payment_request`].
+fn build_self_payment(
+    address: &ZcashAddress,
+    amount: u64,
 ) -> Result<TransactionRequest, MigrationError> {
-    Err(MigrationError::Backend(
-        "self-address request building requires a synced wallet DB (integration gap)".to_string(),
-    ))
+    let value = Zatoshis::from_u64(amount)
+        .map_err(|e| MigrationError::Backend(format!("invalid migration amount: {e:?}")))?;
+    let payment = Payment::without_memo(address.clone(), value);
+    TransactionRequest::new(vec![payment])
+        .map_err(|e| MigrationError::Backend(format!("construct self-payment request: {e:?}")))
+}
+
+/// Build a zip321 request paying `amount` to the account's own current unified address (Ironwood
+/// addresses equal the existing Orchard/unified address, so the migration is a self-send).
+/// Resolving the address requires a synced wallet DB; the request construction is the pure
+/// [`build_self_payment`].
+fn self_payment_request(
+    db: &Db,
+    network: &consensus::Network,
+    account: AccountUuid,
+    amount: u64,
+) -> Result<TransactionRequest, MigrationError> {
+    let address = db
+        .get_last_generated_address_matching(account, UnifiedAddressRequest::AllAvailableKeys)
+        .map_err(|e| MigrationError::Backend(format!("resolve current address: {e:?}")))?
+        .ok_or_else(|| {
+            MigrationError::Backend("account has no current unified address".to_string())
+        })?
+        .to_zcash_address(network.network_type());
+    build_self_payment(&address, amount)
 }
 
 /// The note references a proposal selected as inputs, so successive transfers can reserve them.
@@ -246,7 +268,7 @@ pub(crate) fn sign_schedule(
     let locks = store::locked_note_refs(conn, account_str)?;
     let mut reserved: BTreeSet<ReceivedNoteId> = BTreeSet::new();
     for t in transfers {
-        let request = self_payment_request(db, account, t.amount_zatoshi)?;
+        let request = self_payment_request(db, network, account, t.amount_zatoshi)?;
         let proposal = propose_migration_transfer(
             db,
             network,
@@ -283,7 +305,7 @@ pub(crate) fn sign_split(
     let locks = store::locked_note_refs(conn, account_str)?;
     let reserved: BTreeSet<ReceivedNoteId> = BTreeSet::new();
     let total: u64 = outputs.iter().sum();
-    let request = self_payment_request(db, account, total)?;
+    let request = self_payment_request(db, network, account, total)?;
     let proposal = propose_migration_transfer(
         db,
         network,
@@ -413,6 +435,18 @@ impl OutputProver for NoOpOutputProver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_self_payment_creates_single_payment_for_amount() {
+        let address: ZcashAddress =
+            "ztestsapling1ctuamfer5xjnnrdr3xdazenljx0mu0gutcf9u9e74tr2d3jwjnt0qllzxaplu54hgc2tyjdc2p6"
+                .parse()
+                .expect("address parses");
+        let req = build_self_payment(&address, 100_000_000).expect("request builds");
+        assert_eq!(req.payments().len(), 1);
+        let payment = req.payments().values().next().expect("one payment");
+        assert_eq!(payment.amount().map(u64::from), Some(100_000_000));
+    }
 
     #[test]
     fn consensus_network_maps_variants() {
