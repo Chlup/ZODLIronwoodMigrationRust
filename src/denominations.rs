@@ -6,6 +6,8 @@
 
 pub(crate) const ZATOSHIS_PER_ZEC: u64 = 100_000_000;
 pub(crate) const MIGRATION_MAX_PREPARED_NOTES_PER_RUN: usize = 64;
+/// The smallest residual kept as a migration output (below this it folds into the fee).
+pub(crate) const MIN_IRONWOOD_MIGRATION_OUTPUT_ZATOSHI: u64 = 1;
 
 /// The outcome of planning a note split: the per-note migration output values, an optional
 /// residual kept in Orchard, and the fee/accounting totals.

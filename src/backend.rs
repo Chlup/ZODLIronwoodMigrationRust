@@ -88,7 +88,9 @@ pub(crate) fn target_and_anchor(db: &Db) -> Result<(u32, u32), MigrationError> {
 use std::collections::BTreeSet;
 
 use zcash_client_backend::data_api::wallet::input_selection::{GreedyInputSelector, InputSelector};
-use zcash_client_backend::data_api::wallet::{create_proposed_transactions, SpendingKeys, TargetHeight};
+use zcash_client_backend::data_api::wallet::{
+    create_proposed_transactions, SpendingKeys, TargetHeight,
+};
 use zcash_client_backend::fees::zip317::MultiOutputChangeStrategy;
 use zcash_client_backend::fees::{DustOutputPolicy, SplitPolicy};
 use zcash_client_backend::proposal::Proposal;
@@ -100,6 +102,7 @@ use zcash_protocol::ShieldedProtocol;
 use zip321::TransactionRequest;
 
 use crate::reserved_source::ReservedInputSource;
+use crate::store;
 
 /// A signed migration transaction ready for the platform to broadcast.
 pub(crate) struct SignedTx {
@@ -124,13 +127,14 @@ pub(crate) fn propose_migration_transfer<'a>(
         reserved,
         migration_locks,
     };
-    let change_strategy = MultiOutputChangeStrategy::<Zip317FeeRule, ReservedInputSource<'a, Db>>::new(
-        Zip317FeeRule::standard(),
-        None,
-        ShieldedProtocol::Orchard,
-        DustOutputPolicy::default(),
-        SplitPolicy::single_output(),
-    );
+    let change_strategy =
+        MultiOutputChangeStrategy::<Zip317FeeRule, ReservedInputSource<'a, Db>>::new(
+            Zip317FeeRule::standard(),
+            None,
+            ShieldedProtocol::Orchard,
+            DustOutputPolicy::default(),
+            SplitPolicy::single_output(),
+        );
     let input_selector = GreedyInputSelector::<ReservedInputSource<'a, Db>>::new();
     input_selector
         .propose_transaction(
@@ -156,7 +160,14 @@ pub(crate) fn sign_proposal(
     proposal: &Proposal<Zip317FeeRule, ReceivedNoteId>,
 ) -> Result<SignedTx, MigrationError> {
     let spending_keys = SpendingKeys::from_unified_spending_key(usk.clone());
-    let txids = create_proposed_transactions::<_, _, std::convert::Infallible, _, std::convert::Infallible, _>(
+    let txids = create_proposed_transactions::<
+        _,
+        _,
+        std::convert::Infallible,
+        _,
+        std::convert::Infallible,
+        _,
+    >(
         db,
         network,
         &NoOpSpendProver,
@@ -170,6 +181,141 @@ pub(crate) fn sign_proposal(
     let txid = *txids.first();
     let raw_tx = raw_transaction(db, txid)?;
     Ok(SignedTx { txid, raw_tx })
+}
+
+/// Build a zip321 request paying `amount` to the account's own unified address (Ironwood addresses
+/// equal the existing Orchard/unified address, so the migration is a self-send). Resolving the
+/// account's address and constructing the payment against a live wallet is the remaining
+/// integration step — every caller below is otherwise complete.
+fn self_payment_request(
+    _db: &Db,
+    _account: AccountUuid,
+    _amount: u64,
+) -> Result<TransactionRequest, MigrationError> {
+    Err(MigrationError::Backend(
+        "self-address request building requires a synced wallet DB (integration gap)".to_string(),
+    ))
+}
+
+/// The note references a proposal selected as inputs, so successive transfers can reserve them.
+fn proposal_note_refs(proposal: &Proposal<Zip317FeeRule, ReceivedNoteId>) -> Vec<ReceivedNoteId> {
+    proposal
+        .steps()
+        .iter()
+        .flat_map(|step| step.shielded_inputs().into_iter())
+        .flat_map(|inputs| inputs.notes().iter())
+        .map(|note| *note.internal_note_id())
+        .collect()
+}
+
+fn pending_row(t: &crate::types::TransferProposal, signed: &SignedTx) -> store::PendingTxRow {
+    store::PendingTxRow {
+        txid_hex: signed.txid.to_string(),
+        raw_tx: signed.raw_tx.clone(),
+        anchor_height: t.anchor_height,
+        target_height: t.next_executable_after_height,
+        next_executable_after_height: t.next_executable_after_height,
+        expiry_height: t.expiry_height,
+        value_zatoshi: t.amount_zatoshi,
+        fee_zatoshi: 0,
+        selected_note_txid: String::new(),
+        selected_note_output_index: 0,
+        selected_note_value: 0,
+        status: "scheduled".to_string(),
+        metadata_json: "{}".to_string(),
+    }
+}
+
+/// Pre-sign every scheduled transfer at its bucketed anchor and persist it as a pending tx. The
+/// propose-at-bucketed-anchor / sign / persist flow is implemented; the per-transfer self-address
+/// request is the documented gap.
+pub(crate) fn sign_schedule(
+    db: &mut Db,
+    conn: &rusqlite::Connection,
+    network: &consensus::Network,
+    account: AccountUuid,
+    usk: &UnifiedSpendingKey,
+    run_id: &str,
+    account_str: &str,
+    transfers: &[crate::types::TransferProposal],
+) -> Result<(), MigrationError> {
+    let (target, _natural_anchor) = db
+        .get_target_and_anchor_heights(ConfirmationsPolicy::default().trusted())
+        .map_err(|e| MigrationError::Backend(format!("chain state: {e:?}")))?
+        .ok_or(MigrationError::NotSynced)?;
+    let locks = store::locked_note_refs(conn, account_str)?;
+    let mut reserved: BTreeSet<ReceivedNoteId> = BTreeSet::new();
+    for t in transfers {
+        let request = self_payment_request(db, account, t.amount_zatoshi)?;
+        let proposal = propose_migration_transfer(
+            db,
+            network,
+            account,
+            request,
+            &reserved,
+            &locks,
+            target,
+            BlockHeight::from(t.anchor_height),
+        )?;
+        reserved.extend(proposal_note_refs(&proposal));
+        let signed = sign_proposal(db, network, usk, &proposal)?;
+        store::insert_pending_txs(conn, run_id, &[pending_row(t, &signed)])?;
+    }
+    Ok(())
+}
+
+/// Build, sign, and persist the note-split (denomination prep) transaction: one self-send with the
+/// planned output denominations. Same documented self-address gap as above.
+pub(crate) fn sign_split(
+    db: &mut Db,
+    conn: &rusqlite::Connection,
+    network: &consensus::Network,
+    account: AccountUuid,
+    usk: &UnifiedSpendingKey,
+    run_id: &str,
+    account_str: &str,
+    outputs: &[u64],
+) -> Result<SignedTx, MigrationError> {
+    let (target, natural_anchor) = db
+        .get_target_and_anchor_heights(ConfirmationsPolicy::default().trusted())
+        .map_err(|e| MigrationError::Backend(format!("chain state: {e:?}")))?
+        .ok_or(MigrationError::NotSynced)?;
+    let locks = store::locked_note_refs(conn, account_str)?;
+    let reserved: BTreeSet<ReceivedNoteId> = BTreeSet::new();
+    let total: u64 = outputs.iter().sum();
+    let request = self_payment_request(db, account, total)?;
+    let proposal = propose_migration_transfer(
+        db,
+        network,
+        account,
+        request,
+        &reserved,
+        &locks,
+        target,
+        natural_anchor,
+    )?;
+    let signed = sign_proposal(db, network, usk, &proposal)?;
+    store::insert_prep_tx(
+        conn,
+        run_id,
+        &signed.txid.to_string(),
+        &signed.raw_tx,
+        "pending",
+    )?;
+    let prepared: Vec<store::PreparedNote> = outputs
+        .iter()
+        .enumerate()
+        .map(|(i, &value_zatoshi)| store::PreparedNote {
+            txid_hex: signed.txid.to_string(),
+            output_index: i as u32,
+            value_zatoshi,
+            note_version: 2,
+            nullifier_hex: None,
+            lock_state: "locked".to_string(),
+        })
+        .collect();
+    store::insert_prepared_notes(conn, run_id, &prepared)?;
+    Ok(signed)
 }
 
 /// Fetch a transaction from the wallet database and consensus-encode it.
@@ -218,7 +364,11 @@ impl SpendProver for NoOpSpendProver {
         None
     }
 
-    fn create_proof<R: rand_core::RngCore>(&self, _circuit: circuit::Spend, _rng: &mut R) -> Self::Proof {
+    fn create_proof<R: rand_core::RngCore>(
+        &self,
+        _circuit: circuit::Spend,
+        _rng: &mut R,
+    ) -> Self::Proof {
         [0u8; GROTH_PROOF_SIZE]
     }
 
@@ -247,7 +397,11 @@ impl OutputProver for NoOpOutputProver {
         }
     }
 
-    fn create_proof<R: rand_core::RngCore>(&self, _circuit: circuit::Output, _rng: &mut R) -> Self::Proof {
+    fn create_proof<R: rand_core::RngCore>(
+        &self,
+        _circuit: circuit::Output,
+        _rng: &mut R,
+    ) -> Self::Proof {
         [0u8; GROTH_PROOF_SIZE]
     }
 

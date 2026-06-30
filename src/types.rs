@@ -100,9 +100,13 @@ pub enum AttentionReason {
 /// The outcome of a broadcast attempt, reported back to the engine by the platform.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransferResult {
-    Success { txid: String },
+    Success {
+        txid: String,
+    },
     /// Transient network failure; `retryable` indicates whether to retry in a later window.
-    NetworkError { retryable: bool },
+    NetworkError {
+        retryable: bool,
+    },
     /// The input note was already spent.
     InvalidNote,
     /// The transaction's anchor/expiry height has passed.

@@ -25,7 +25,10 @@ impl fmt::Display for MigrationError {
             MigrationError::NotSynced => write!(f, "wallet must finish syncing first"),
             MigrationError::InvalidState(s) => write!(f, "invalid migration state: {s}"),
             MigrationError::NotInitialized => {
-                write!(f, "migration not initialized; call initialize_post_upgrade first")
+                write!(
+                    f,
+                    "migration not initialized; call initialize_post_upgrade first"
+                )
             }
             MigrationError::Db(s) => write!(f, "database error: {s}"),
             MigrationError::Backend(s) => write!(f, "backend error: {s}"),
@@ -47,7 +50,10 @@ mod tests {
 
     #[test]
     fn display_is_human_readable() {
-        assert!(MigrationError::NotSynced.to_string().to_lowercase().contains("sync"));
+        assert!(MigrationError::NotSynced
+            .to_string()
+            .to_lowercase()
+            .contains("sync"));
         assert!(MigrationError::NotInitialized
             .to_string()
             .to_lowercase()

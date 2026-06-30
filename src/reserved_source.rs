@@ -107,9 +107,12 @@ impl<DbT: InputSource> InputSource for ReservedInputSource<'_, DbT> {
         target_height: TargetHeight,
         exclude: &[Self::NoteRef],
     ) -> Result<ReceivedNotes<Self::NoteRef>, Self::Error> {
-        let selected =
-            self.inner
-                .select_unspent_notes(account, sources, target_height, &self.merged_excludes(exclude))?;
+        let selected = self.inner.select_unspent_notes(
+            account,
+            sources,
+            target_height,
+            &self.merged_excludes(exclude),
+        )?;
         Ok(ReceivedNotes::new(
             selected.sapling().to_vec(),
             selected

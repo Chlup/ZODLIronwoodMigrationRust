@@ -60,7 +60,7 @@ jubjub = { version = "0.10", optional = true }
 bls12_381 = { version = "0.8", optional = true }
 rand_core = { version = "0.6", optional = true }
 rand = { version = "0.8", optional = true }
-uuid = { version = "1", optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"

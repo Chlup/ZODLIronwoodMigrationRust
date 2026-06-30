@@ -221,6 +221,9 @@ pub(crate) fn insert_run(conn: &Connection, run: &NewRun) -> rusqlite::Result<()
     Ok(())
 }
 
+// Tested run accessor by primary key; the facade resolves runs via `active_run`, so this is
+// retained for direct lookups (e.g. by future reconciliation code) but not yet wired in.
+#[allow(dead_code)]
 pub(crate) fn run_by_id(conn: &Connection, run_id: &str) -> rusqlite::Result<Option<RunRow>> {
     conn.query_row(
         &format!("SELECT {RUN_COLUMNS} FROM ironwood_migration_runs WHERE run_id = ?1"),
@@ -352,6 +355,19 @@ pub(crate) fn next_due_transfer(
         map_pending_row,
     )
     .optional()
+}
+
+/// The earliest send height among a run's still-scheduled transfers, or `None` if none remain.
+pub(crate) fn next_scheduled_send_height(
+    conn: &Connection,
+    run_id: &str,
+) -> rusqlite::Result<Option<u32>> {
+    conn.query_row(
+        "SELECT MIN(next_executable_after_height) FROM ironwood_migration_pending_txs
+         WHERE run_id = ?1 AND status = 'scheduled'",
+        params![run_id],
+        |row| row.get::<_, Option<u32>>(0),
+    )
 }
 
 pub(crate) fn mark_pending_status(
@@ -570,11 +586,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            next_due_transfer(&conn, "r1", 1800).unwrap().unwrap().txid_hex,
+            next_due_transfer(&conn, "r1", 1800)
+                .unwrap()
+                .unwrap()
+                .txid_hex,
             "t1"
         );
         assert_eq!(
-            next_due_transfer(&conn, "r1", 4000).unwrap().unwrap().txid_hex,
+            next_due_transfer(&conn, "r1", 4000)
+                .unwrap()
+                .unwrap()
+                .txid_hex,
             "t1"
         );
         assert!(next_due_transfer(&conn, "r1", 100).unwrap().is_none());
@@ -596,6 +618,24 @@ mod tests {
         insert_pending_txs(&conn, "r1", std::slice::from_ref(&row)).unwrap();
         let got = next_due_transfer(&conn, "r1", 9999).unwrap().unwrap();
         assert_eq!(got, row);
+    }
+
+    #[test]
+    fn next_scheduled_send_height_returns_min_or_none() {
+        let conn = db();
+        sample_run(&conn, "r1", Phase::BroadcastScheduled);
+        assert_eq!(next_scheduled_send_height(&conn, "r1").unwrap(), None);
+        insert_pending_txs(
+            &conn,
+            "r1",
+            &[
+                pending("t1", 2000, "scheduled"),
+                pending("t2", 1500, "scheduled"),
+                pending("t3", 999, "broadcasted"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(next_scheduled_send_height(&conn, "r1").unwrap(), Some(1500));
     }
 
     #[test]
@@ -638,7 +678,10 @@ mod tests {
         insert_pending_txs(
             &conn,
             "r1",
-            &[pending("t1", 1, "scheduled"), pending("t2", 2, "broadcasted")],
+            &[
+                pending("t1", 1, "scheduled"),
+                pending("t2", 2, "broadcasted"),
+            ],
         )
         .unwrap();
         assert_eq!(clear_scheduled_pending(&conn, "r1").unwrap(), 1);

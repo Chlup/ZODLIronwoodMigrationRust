@@ -70,8 +70,8 @@ fn estimated_duration_hours(transfer_count: usize, first_delay_blocks: u32) -> u
     let Some(last_index) = transfer_count.checked_sub(1) else {
         return 0;
     };
-    let span_blocks =
-        first_delay_blocks.saturating_add((last_index as u32).saturating_mul(TRANSFER_CADENCE_BLOCKS));
+    let span_blocks = first_delay_blocks
+        .saturating_add((last_index as u32).saturating_mul(TRANSFER_CADENCE_BLOCKS));
     span_blocks.div_ceil(BLOCKS_PER_HOUR)
 }
 
@@ -105,15 +105,31 @@ mod tests {
 
     #[test]
     fn schedule_shares_one_bucketed_anchor_across_transfers() {
-        let s = build_schedule("run", &[10, 20, 30], 1000, 2_880_290, FIRST_TRANSFER_DELAY_BLOCKS);
+        let s = build_schedule(
+            "run",
+            &[10, 20, 30],
+            1000,
+            2_880_290,
+            FIRST_TRANSFER_DELAY_BLOCKS,
+        );
         let anchors: Vec<u32> = s.transfers.iter().map(|t| t.anchor_height).collect();
         assert_eq!(anchors, vec![2_880_288, 2_880_288, 2_880_288]);
     }
 
     #[test]
     fn schedule_staggers_send_and_expiry_heights() {
-        let s = build_schedule("run", &[10, 20, 30], 1000, 2000, FIRST_TRANSFER_DELAY_BLOCKS);
-        let sends: Vec<u32> = s.transfers.iter().map(|t| t.next_executable_after_height).collect();
+        let s = build_schedule(
+            "run",
+            &[10, 20, 30],
+            1000,
+            2000,
+            FIRST_TRANSFER_DELAY_BLOCKS,
+        );
+        let sends: Vec<u32> = s
+            .transfers
+            .iter()
+            .map(|t| t.next_executable_after_height)
+            .collect();
         assert_eq!(sends, vec![1000 + 288, 1000 + 576, 1000 + 864]);
         let expiries: Vec<u32> = s.transfers.iter().map(|t| t.expiry_height).collect();
         assert_eq!(expiries, vec![1576, 1864, 2152]); // each send + 288
@@ -121,14 +137,26 @@ mod tests {
 
     #[test]
     fn schedule_maps_amounts_in_order() {
-        let s = build_schedule("run", &[10, 20, 30], 1000, 2000, FIRST_TRANSFER_DELAY_BLOCKS);
+        let s = build_schedule(
+            "run",
+            &[10, 20, 30],
+            1000,
+            2000,
+            FIRST_TRANSFER_DELAY_BLOCKS,
+        );
         let amounts: Vec<u64> = s.transfers.iter().map(|t| t.amount_zatoshi).collect();
         assert_eq!(amounts, vec![10, 20, 30]);
     }
 
     #[test]
     fn schedule_transfer_ids_are_unique_and_carry_run_id() {
-        let s = build_schedule("RUN42", &[10, 20, 30], 1000, 2000, FIRST_TRANSFER_DELAY_BLOCKS);
+        let s = build_schedule(
+            "RUN42",
+            &[10, 20, 30],
+            1000,
+            2000,
+            FIRST_TRANSFER_DELAY_BLOCKS,
+        );
         let ids: Vec<String> = s.transfers.iter().map(|t| t.id.clone()).collect();
         let unique: std::collections::HashSet<&String> = ids.iter().collect();
         assert_eq!(unique.len(), 3);

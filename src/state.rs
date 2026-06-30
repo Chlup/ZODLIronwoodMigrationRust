@@ -137,7 +137,10 @@ mod tests {
     fn known_phase_strings_are_vizor_compatible() {
         assert_eq!(Phase::NoOrchardFunds.as_str(), "no_orchard_funds");
         assert_eq!(Phase::ReadyToMigrate.as_str(), "ready_to_migrate");
-        assert_eq!(Phase::WaitingMigrationConfirmations.as_str(), "waiting_migration_confirmations");
+        assert_eq!(
+            Phase::WaitingMigrationConfirmations.as_str(),
+            "waiting_migration_confirmations"
+        );
         assert_eq!(Phase::FailedRecoverable.as_str(), "failed_recoverable");
     }
 
@@ -155,13 +158,19 @@ mod tests {
             Phase::ReadyToPrepare,
             Phase::Abandoned,
         ] {
-            assert_eq!(to_state(phase, progress(), None), MigrationState::NotStarted);
+            assert_eq!(
+                to_state(phase, progress(), None),
+                MigrationState::NotStarted
+            );
         }
     }
 
     #[test]
     fn split_phases_map_to_split_pending_confirmation() {
-        for phase in [Phase::PreparingDenominations, Phase::WaitingDenomConfirmations] {
+        for phase in [
+            Phase::PreparingDenominations,
+            Phase::WaitingDenomConfirmations,
+        ] {
             assert_eq!(
                 to_state(phase, progress(), None),
                 MigrationState::SplitPendingConfirmation
@@ -194,7 +203,10 @@ mod tests {
 
     #[test]
     fn complete_maps_to_complete() {
-        assert_eq!(to_state(Phase::Complete, progress(), None), MigrationState::Complete);
+        assert_eq!(
+            to_state(Phase::Complete, progress(), None),
+            MigrationState::Complete
+        );
     }
 
     #[test]
