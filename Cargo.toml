@@ -9,35 +9,35 @@ repository = "https://github.com/ZODL/ZODLIronwoodMigrationRust"
 [features]
 # The valargroup-backed integration (the ReservedInputSource adapter, the propose/sign/balance
 # calls, and the MigrationContext facade) is on by default. Building/testing the lightweight
-# core in isolation is `cargo test --no-default-features` (fast, no git fetch).
+# core in isolation is `cargo test --no-default-features` (links only the lightweight zcash_protocol).
 default = ["librustzcash-backend"]
 librustzcash-backend = [
     "dep:zcash_client_backend",
     "dep:zcash_client_sqlite",
     "dep:zcash_primitives",
     "dep:zcash_keys",
-    "dep:zcash_protocol",
     "dep:zcash_address",
     "dep:zcash_proofs",
     "dep:zcash_transparent",
     "dep:zip321",
     "dep:orchard",
-    "dep:sapling-crypto",
-    "dep:jubjub",
-    "dep:bls12_381",
-    "dep:rand_core",
+    "dep:pczt",
     "dep:rand",
     "dep:uuid",
 ]
 
 [dependencies]
-# ----- core (always compiled, valargroup-free) -----
+# ----- core (always compiled) -----
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # MUST single-version with the librustzcash workspace (rusqlite 0.37 + bundled) so there is one
 # rusqlite and one bundled libsqlite3-sys across the whole build.
 rusqlite = { version = "0.37", features = ["bundled"] }
 hex = "0.4"
+# zcash_protocol is REQUIRED: the public API uses its canonical Network/Zatoshis/BlockHeight types.
+# Pinned to the same fork+branch as the backend crates so the direct and transitive zcash_protocol
+# resolve to a single crate.
+zcash_protocol = { version = "0.9", git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts" }
 
 # ----- backend (optional): the valargroup librustzcash fork -----
 # All librustzcash crates are pinned by rev (reproducible); they share one git source so they
@@ -46,21 +46,18 @@ hex = "0.4"
 # single orchard (a `rev` spec would not unify with the workspace's `branch` spec).
 # The Ironwood APIs are gated `#[cfg(zcash_unstable = "nu6.3")]`; the cfg is set in
 # .cargo/config.toml. `unstable` exposes the `proposed_version` parameter used to force V6.
-zcash_client_backend = { version = "0.23", git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts", features = ["orchard", "transparent-inputs", "unstable"], optional = true }
+zcash_client_backend = { version = "0.23", git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts", features = ["orchard", "transparent-inputs", "unstable", "pczt"], optional = true }
 zcash_client_sqlite = { version = "0.21", git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts", features = ["orchard", "transparent-inputs", "unstable", "serde"], optional = true }
 zcash_primitives = { version = "0.28", git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts", optional = true }
 zcash_keys = { version = "0.14", git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts", features = ["orchard"], optional = true }
-zcash_protocol = { version = "0.9", git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts", optional = true }
 zcash_address = { version = "0.12", git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts", optional = true }
 zcash_transparent = { version = "0.8", git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts", optional = true }
 zip321 = { version = "0.8", git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts", optional = true }
 zcash_proofs = { version = "0.28", git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts", optional = true }
-orchard = { version = "0.14", git = "https://github.com/zcash/orchard", branch = "adam/qleak-dummy-ciphertexts-on-pr505", default-features = false, optional = true }
-# Needed to port vizor's no-op Sapling provers (Orchard-only migration txs never invoke them).
-sapling-crypto = { version = "0.7", default-features = false, optional = true }
-jubjub = { version = "0.10", optional = true }
-bls12_381 = { version = "0.8", optional = true }
-rand_core = { version = "0.6", optional = true }
+# pczt: the crate persists/signs migration txs as PCZTs (issue #1). Role features mirror what
+# zcash_client_backend's `pczt` feature enables, plus `orchard`.
+pczt = { version = "0.7", git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts", default-features = false, features = ["orchard", "io-finalizer", "prover", "signer", "spend-finalizer", "tx-extractor", "zcp-builder"], optional = true }
+orchard = { version = "0.14", git = "https://github.com/zcash/orchard", branch = "adam/qleak-dummy-ciphertexts-on-pr505", default-features = false, features = ["circuit"], optional = true }
 rand = { version = "0.8", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
 

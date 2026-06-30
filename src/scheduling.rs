@@ -9,6 +9,8 @@
 //! user confirmed the schedule. See the design spec §6.
 
 use crate::types::{MigrationSchedule, TransferProposal};
+use zcash_protocol::consensus::BlockHeight;
+use zcash_protocol::value::Zatoshis;
 
 /// Width of an anchor bucket, in blocks (~6 hours at ~75 s/block).
 pub(crate) const ANCHOR_BUCKET_SIZE: u32 = 288;
@@ -40,21 +42,22 @@ pub(crate) fn build_schedule(
     natural_anchor: u32,
     first_delay_blocks: u32,
 ) -> MigrationSchedule {
-    let anchor_height = bucket_anchor(natural_anchor);
+    let anchor_height = BlockHeight::from_u32(bucket_anchor(natural_anchor));
     let transfers = amounts
         .iter()
         .enumerate()
-        .map(|(i, &amount_zatoshi)| {
-            let next_executable_after_height = target_height
+        .map(|(i, &amount)| {
+            let next = target_height
                 .saturating_add(first_delay_blocks)
                 .saturating_add((i as u32).saturating_mul(TRANSFER_CADENCE_BLOCKS));
             TransferProposal {
                 id: format!("{run_id}-{i}"),
-                amount_zatoshi,
+                amount: Zatoshis::const_from_u64(amount),
                 anchor_height,
-                next_executable_after_height,
-                expiry_height: next_executable_after_height
-                    .saturating_add(TRANSFER_EXPIRY_WINDOW_BLOCKS),
+                next_executable_after_height: BlockHeight::from_u32(next),
+                expiry_height: BlockHeight::from_u32(
+                    next.saturating_add(TRANSFER_EXPIRY_WINDOW_BLOCKS),
+                ),
             }
         })
         .collect();
@@ -112,7 +115,11 @@ mod tests {
             2_880_290,
             FIRST_TRANSFER_DELAY_BLOCKS,
         );
-        let anchors: Vec<u32> = s.transfers.iter().map(|t| t.anchor_height).collect();
+        let anchors: Vec<u32> = s
+            .transfers
+            .iter()
+            .map(|t| u32::from(t.anchor_height))
+            .collect();
         assert_eq!(anchors, vec![2_880_288, 2_880_288, 2_880_288]);
     }
 
@@ -128,10 +135,14 @@ mod tests {
         let sends: Vec<u32> = s
             .transfers
             .iter()
-            .map(|t| t.next_executable_after_height)
+            .map(|t| u32::from(t.next_executable_after_height))
             .collect();
         assert_eq!(sends, vec![1000 + 288, 1000 + 576, 1000 + 864]);
-        let expiries: Vec<u32> = s.transfers.iter().map(|t| t.expiry_height).collect();
+        let expiries: Vec<u32> = s
+            .transfers
+            .iter()
+            .map(|t| u32::from(t.expiry_height))
+            .collect();
         assert_eq!(expiries, vec![1576, 1864, 2152]); // each send + 288
     }
 
@@ -144,7 +155,7 @@ mod tests {
             2000,
             FIRST_TRANSFER_DELAY_BLOCKS,
         );
-        let amounts: Vec<u64> = s.transfers.iter().map(|t| t.amount_zatoshi).collect();
+        let amounts: Vec<u64> = s.transfers.iter().map(|t| u64::from(t.amount)).collect();
         assert_eq!(amounts, vec![10, 20, 30]);
     }
 
@@ -174,7 +185,7 @@ mod tests {
     #[test]
     fn immediate_schedule_has_no_first_delay() {
         let s = build_schedule("r", &[1], 1000, 2000, 0);
-        assert_eq!(s.transfers[0].next_executable_after_height, 1000);
+        assert_eq!(u32::from(s.transfers[0].next_executable_after_height), 1000);
         assert_eq!(s.estimated_duration_hours, 0);
     }
 }

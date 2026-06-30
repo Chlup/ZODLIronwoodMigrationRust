@@ -1,18 +1,19 @@
 //! The [`MigrationContext`] facade: the public, synchronous API the platform SDKs wrap. It ties
-//! the valargroup-free core (denominations, scheduling, state, store) to the librustzcash backend.
+//! the core (denominations, scheduling, state, store) to the librustzcash backend.
 //!
-//! Methods that only touch the engine's own SQLite tables (`record_transfer_result`,
-//! the no-run state) are exercised by unit tests with a temporary database. Methods that read
-//! balances/heights or sign transactions are compile-verified against the real valargroup APIs;
-//! exercising them end-to-end needs a seeded, synced wallet database (a documented integration
-//! gap, per the design spec D4).
+//! Methods that only touch the engine's own SQLite tables (`record_transfer_result`, the no-run
+//! state) are exercised by unit tests with a temporary database. Methods that read balances/heights
+//! or build/sign PCZTs are compile-verified against the real valargroup APIs; exercising them
+//! end-to-end needs a seeded, synced wallet database (a documented integration gap, per spec D4).
 
 use rusqlite::Connection;
 use uuid::Uuid;
+use zcash_protocol::consensus::BlockHeight;
+use zcash_protocol::value::Zatoshis;
 
 use crate::backend::{self, Db};
-use crate::denominations::{plan_denominations, MIN_IRONWOOD_MIGRATION_OUTPUT_ZATOSHI};
-use crate::error::MigrationError;
+use crate::denominations::plan_denominations;
+use crate::error::{InvalidStateError, MigrationError};
 use crate::scheduling;
 use crate::state::{self, Phase};
 use crate::store;
@@ -45,7 +46,7 @@ impl MigrationContext {
             network,
             account_uuid,
         };
-        // Ensure the ironwood_migration_* tables exist.
+        // Ensure the ext_ironwood_migration_* tables exist.
         let _ = ctx.store_conn()?;
         Ok(ctx)
     }
@@ -68,8 +69,8 @@ impl MigrationContext {
 
     fn network_str(&self) -> &'static str {
         match self.network {
-            Network::Main => "main",
-            Network::Test => "test",
+            Network::MainNetwork => "main",
+            Network::TestNetwork => "test",
         }
     }
 
@@ -97,8 +98,9 @@ impl MigrationContext {
         let Some(run) = self.active_run(&conn)? else {
             return Ok(MigrationState::NotStarted);
         };
-        let phase = Phase::parse(&run.phase)
-            .ok_or_else(|| MigrationError::InvalidState(format!("unknown phase: {}", run.phase)))?;
+        let phase = Phase::parse(&run.phase).ok_or_else(|| {
+            MigrationError::InvalidState(InvalidStateError::UnknownPhase(run.phase.clone()))
+        })?;
         let progress = self.progress_for_run(&conn, &run.run_id)?;
         let attention = run
             .last_error
@@ -135,12 +137,13 @@ impl MigrationContext {
         run_id: &str,
     ) -> Result<MigrationProgress, MigrationError> {
         let totals = store::pending_totals(conn, run_id)?;
-        let remaining_orchard_zatoshi = self.orchard_spendable().unwrap_or(0);
-        let next_transfer_ready_at_height = store::next_scheduled_send_height(conn, run_id)?;
+        let remaining_orchard = Zatoshis::const_from_u64(self.orchard_spendable().unwrap_or(0));
+        let next_transfer_ready_at_height =
+            store::next_scheduled_send_height(conn, run_id)?.map(BlockHeight::from_u32);
         Ok(MigrationProgress {
             completed_transfers: totals.confirmed,
             total_transfers: totals.total,
-            remaining_orchard_zatoshi,
+            remaining_orchard,
             next_transfer_ready_at_height,
         })
     }
@@ -169,24 +172,21 @@ impl MigrationContext {
         Ok(self.orchard_spendable()? > 0)
     }
 
-    /// Compute the optimal note split for the spendable Orchard balance.
+    /// Compute the optimal note split for the spendable Orchard balance. Each output note is
+    /// self-funding (`power_of_ten + buffer`); any residual stays in Orchard.
     pub fn prepare_note_split(&self) -> Result<NoteSplitProposal, MigrationError> {
         let total = self.orchard_spendable()?;
-        let plan = plan_denominations(
-            total,
-            FEE_ESTIMATE_ZATOSHI,
-            FEE_ESTIMATE_ZATOSHI,
-            MIN_IRONWOOD_MIGRATION_OUTPUT_ZATOSHI,
-        )
-        .map_err(MigrationError::Backend)?;
+        let plan =
+            plan_denominations(total, FEE_ESTIMATE_ZATOSHI).map_err(MigrationError::Pipeline)?;
         Ok(NoteSplitProposal {
             output_notes: plan.migration_outputs,
             fee: plan.prep_fee_zatoshi,
         })
     }
 
-    /// Build, sign, and persist the note-split transaction; returns the bytes for the platform to
-    /// broadcast. The split is a wallet-internal multi-output send to the account's own address.
+    /// Build, sign (as a PCZT), and persist the note-split transaction; returns the serialized PCZT
+    /// for the platform to extract and broadcast. The split is a wallet-internal multi-output send
+    /// to the account's own address.
     pub fn sign_note_split(
         &self,
         proposal: &NoteSplitProposal,
@@ -212,7 +212,7 @@ impl MigrationContext {
         let signed = backend::sign_split(
             &mut db,
             &conn,
-            &backend::consensus_network(self.network),
+            &self.network,
             account,
             &parsed,
             &run_id,
@@ -222,29 +222,25 @@ impl MigrationContext {
         Ok(PreparedTx {
             id: format!("prep:{run_id}"),
             txid: signed.txid.to_string(),
-            raw_tx: signed.raw_tx,
+            raw_pczt: signed.raw_pczt,
         })
     }
 
     // ----- migration proposal -----
 
-    /// Generate the full migration schedule for the spendable Orchard balance.
+    /// Generate the full migration schedule for the spendable Orchard balance. Each transfer's
+    /// `amount` is the value that crosses the turnstile (the pre-split note pays its own fee).
     pub fn propose_migration_transfers(&self) -> Result<MigrationSchedule, MigrationError> {
         let db = self.open_wallet()?;
         let (target, anchor) = backend::target_and_anchor(&db)?;
         let total = backend::pool_balances(&db, backend::account_uuid(self.account_uuid))?
             .orchard_spendable;
-        let plan = plan_denominations(
-            total,
-            FEE_ESTIMATE_ZATOSHI,
-            FEE_ESTIMATE_ZATOSHI,
-            MIN_IRONWOOD_MIGRATION_OUTPUT_ZATOSHI,
-        )
-        .map_err(MigrationError::Backend)?;
+        let plan =
+            plan_denominations(total, FEE_ESTIMATE_ZATOSHI).map_err(MigrationError::Pipeline)?;
         let run_id = new_run_id();
         Ok(scheduling::build_schedule(
             &run_id,
-            &plan.migration_outputs,
+            &plan.crossing_values,
             target,
             anchor,
             scheduling::FIRST_TRANSFER_DELAY_BLOCKS,
@@ -283,7 +279,7 @@ impl MigrationContext {
         backend::sign_schedule(
             &mut db,
             &conn,
-            &backend::consensus_network(self.network),
+            &self.network,
             account,
             &parsed,
             &run_id,
@@ -297,13 +293,14 @@ impl MigrationContext {
     // ----- background execution -----
 
     /// Whether a sync is required before the next transfer (change returned to Orchard). With the
-    /// clean power-of-10 denominations each transfer spends a whole pre-split note and produces no
+    /// clean self-funding denominations each transfer spends a whole pre-split note and produces no
     /// Orchard change, so this is false; richer change detection is a future refinement.
     pub fn is_sync_required_before_next_transfer(&self) -> Result<bool, MigrationError> {
         Ok(false)
     }
 
-    /// The next height-due pre-signed transfer, or `None`. The platform broadcasts it, then calls
+    /// The next height-due pre-signed transfer, or `None`. The platform extracts the transaction
+    /// from `raw_pczt` (see [`Self::extract_broadcast_tx`]), broadcasts it, then calls
     /// [`Self::record_transfer_result`].
     pub fn next_due_transfer(&self) -> Result<Option<PreparedTx>, MigrationError> {
         let conn = self.store_conn()?;
@@ -316,7 +313,7 @@ impl MigrationContext {
                 return Ok(Some(PreparedTx {
                     id: format!("prep:{}", run.run_id),
                     txid: prep.txid_hex,
-                    raw_tx: prep.raw_tx,
+                    raw_pczt: prep.raw_pczt,
                 }));
             }
         }
@@ -328,8 +325,25 @@ impl MigrationContext {
         Ok(Some(PreparedTx {
             id: tx.txid_hex.clone(),
             txid: tx.txid_hex,
-            raw_tx: tx.raw_tx,
+            raw_pczt: tx.raw_pczt,
         }))
+    }
+
+    /// Extract the broadcast-ready consensus transaction bytes from a serialized signed PCZT (as
+    /// carried in [`PreparedTx::raw_pczt`]). Convenience for callers not already linking librustzcash.
+    pub fn extract_broadcast_tx(&self, raw_pczt: &[u8]) -> Result<Vec<u8>, MigrationError> {
+        backend::extract_broadcast_tx(raw_pczt)
+    }
+
+    /// Re-propose at a fresh bucketed anchor and re-sign the active run's scheduled transfers,
+    /// replacing PCZTs whose anchor may have gone stale (the §4.2 "update proof" operation). Returns
+    /// the number of transfers refreshed. A future refinement re-anchors the persisted PCZTs in
+    /// place via the updater role rather than regenerating them.
+    pub fn refresh_stale_transfers(&self, usk: &[u8]) -> Result<u32, MigrationError> {
+        let schedule = self.restart_current_migration_step()?;
+        let count = schedule.transfers.len() as u32;
+        self.sign_and_store_migration_schedule(&schedule, usk)?;
+        Ok(count)
     }
 
     /// Record the platform's broadcast outcome, advancing the engine's state.
@@ -340,9 +354,7 @@ impl MigrationContext {
     ) -> Result<(), MigrationError> {
         let conn = self.store_conn()?;
         let Some(run) = self.active_run(&conn)? else {
-            return Err(MigrationError::InvalidState(
-                "no active migration run".to_string(),
-            ));
+            return Err(MigrationError::InvalidState(InvalidStateError::NoActiveRun));
         };
         // A result for the note-split (prep) transaction advances the split phase.
         if let Some(run_id) = transfer_id.strip_prefix("prep:") {
@@ -446,7 +458,7 @@ mod tests {
     fn ctx() -> (NamedTempFile, MigrationContext) {
         let file = NamedTempFile::new().unwrap();
         let path = file.path().to_str().unwrap().to_string();
-        let ctx = MigrationContext::new(&path, Network::Main, [7u8; 16]).unwrap();
+        let ctx = MigrationContext::new(&path, Network::MainNetwork, [7u8; 16]).unwrap();
         (file, ctx)
     }
 

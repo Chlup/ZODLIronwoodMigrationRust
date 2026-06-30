@@ -1,16 +1,54 @@
 //! Public, `serde`-derivable data types exchanged across the FFI/JNI boundary.
 //!
-//! All amounts are zatoshi (`u64`); all block heights are `u32`. The FFI/JNI glue marshals
-//! these (JSON today); enums use serde's default external tagging, which the platform glue
-//! turns into a tag + fields.
+//! Amounts use [`zcash_protocol::value::Zatoshis`] and heights use
+//! [`zcash_protocol::consensus::BlockHeight`] — the canonical librustzcash types, which enforce
+//! their own invariants. The FFI/JNI glue marshals these as JSON; the `Zatoshis`/`BlockHeight`
+//! newtypes are serialized as plain `u64`/`u32` numbers via the adapter modules below.
 
 use serde::{Deserialize, Serialize};
+use zcash_protocol::consensus::BlockHeight;
+use zcash_protocol::value::Zatoshis;
 
-/// The Zcash network the wallet operates on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Network {
-    Main,
-    Test,
+/// The Zcash network the wallet operates on (re-exported canonical type).
+pub use zcash_protocol::consensus::Network;
+
+/// serde adapter: (de)serialize a [`Zatoshis`] as a plain `u64`.
+pub(crate) mod serde_zatoshis {
+    use super::Zatoshis;
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(v: &Zatoshis, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u64(u64::from(*v))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Zatoshis, D::Error> {
+        Zatoshis::from_u64(u64::deserialize(d)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// serde adapter: (de)serialize a [`BlockHeight`] as a plain `u32`.
+pub(crate) mod serde_block_height {
+    use super::BlockHeight;
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(v: &BlockHeight, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u32(u32::from(*v))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<BlockHeight, D::Error> {
+        Ok(BlockHeight::from_u32(u32::deserialize(d)?))
+    }
+}
+
+/// serde adapter: (de)serialize an `Option<BlockHeight>` as an optional plain `u32`.
+pub(crate) mod serde_opt_block_height {
+    use super::BlockHeight;
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(v: &Option<BlockHeight>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(h) => s.serialize_some(&u32::from(*h)),
+            None => s.serialize_none(),
+        }
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<BlockHeight>, D::Error> {
+        Ok(Option::<u32>::deserialize(d)?.map(BlockHeight::from_u32))
+    }
 }
 
 /// How the platform should broadcast migration transactions.
@@ -32,16 +70,22 @@ pub struct NoteSplitProposal {
 
 /// A single scheduled migration transfer.
 ///
+/// `amount` is the value that crosses the turnstile — a power-of-ten ZEC amount; the note actually
+/// spent is `amount + TRANSFER_FEE_BUFFER_ZATOSHI` (the note pays its own transfer fee).
 /// `anchor_height` comes from a shared network-wide 288-block bucket; `next_executable_after_height`
 /// is when the platform may broadcast it; after `expiry_height` it is invalid and the step must be
 /// restarted.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferProposal {
     pub id: String,
-    pub amount_zatoshi: u64,
-    pub anchor_height: u32,
-    pub next_executable_after_height: u32,
-    pub expiry_height: u32,
+    #[serde(with = "serde_zatoshis")]
+    pub amount: Zatoshis,
+    #[serde(with = "serde_block_height")]
+    pub anchor_height: BlockHeight,
+    #[serde(with = "serde_block_height")]
+    pub next_executable_after_height: BlockHeight,
+    #[serde(with = "serde_block_height")]
+    pub expiry_height: BlockHeight,
 }
 
 /// The full migration schedule presented to the user for one-time confirmation.
@@ -56,17 +100,22 @@ pub struct MigrationSchedule {
 pub struct MigrationProgress {
     pub completed_transfers: u32,
     pub total_transfers: u32,
-    pub remaining_orchard_zatoshi: u64,
-    pub next_transfer_ready_at_height: Option<u32>,
+    #[serde(with = "serde_zatoshis")]
+    pub remaining_orchard: Zatoshis,
+    #[serde(with = "serde_opt_block_height")]
+    pub next_transfer_ready_at_height: Option<BlockHeight>,
 }
 
-/// A pre-signed transaction for the platform to broadcast. `raw_tx` is the consensus-encoded
-/// transaction; `txid` is its (pre-computed) transaction id.
+/// A pre-signed transaction for the platform to broadcast, carried as a serialized PCZT.
+///
+/// `raw_pczt` is the serialized `pczt::Pczt` (proven + signed); `txid` is its (pre-computed)
+/// transaction id. The platform extracts the consensus transaction from the PCZT (one librustzcash
+/// call) and broadcasts it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreparedTx {
     pub id: String,
     pub txid: String,
-    pub raw_tx: Vec<u8>,
+    pub raw_pczt: Vec<u8>,
 }
 
 /// Top-level migration state machine surfaced to the app.
@@ -116,6 +165,8 @@ pub enum TransferResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zcash_protocol::consensus::BlockHeight;
+    use zcash_protocol::value::Zatoshis;
 
     fn round_trip<T>(value: &T) -> T
     where
@@ -123,12 +174,6 @@ mod tests {
     {
         let json = serde_json::to_string(value).expect("serialize");
         serde_json::from_str(&json).expect("deserialize")
-    }
-
-    #[test]
-    fn network_round_trips() {
-        assert_eq!(round_trip(&Network::Main), Network::Main);
-        assert_eq!(round_trip(&Network::Test), Network::Test);
     }
 
     #[test]
@@ -141,15 +186,22 @@ mod tests {
     }
 
     #[test]
-    fn transfer_proposal_round_trips() {
+    fn transfer_proposal_round_trips_canonical_types() {
         let t = TransferProposal {
             id: "abc".to_string(),
-            amount_zatoshi: 1_000_000_000,
-            anchor_height: 2_880_000,
-            next_executable_after_height: 2_880_288,
-            expiry_height: 2_880_576,
+            amount: Zatoshis::const_from_u64(1_000_000_000),
+            anchor_height: BlockHeight::from_u32(2_880_000),
+            next_executable_after_height: BlockHeight::from_u32(2_880_288),
+            expiry_height: BlockHeight::from_u32(2_880_576),
         };
-        assert_eq!(round_trip(&t), t);
+        let json = serde_json::to_string(&t).unwrap();
+        // Canonical newtypes are marshaled as plain numbers (not nested objects).
+        assert!(json.contains("1000000000"));
+        assert!(json.contains("2880576"));
+        let back: TransferProposal = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.amount, t.amount);
+        assert_eq!(back.expiry_height, t.expiry_height);
+        assert_eq!(back, t);
     }
 
     #[test]
@@ -157,10 +209,10 @@ mod tests {
         let s = MigrationSchedule {
             transfers: vec![TransferProposal {
                 id: "t1".to_string(),
-                amount_zatoshi: 5,
-                anchor_height: 1,
-                next_executable_after_height: 2,
-                expiry_height: 3,
+                amount: Zatoshis::const_from_u64(5),
+                anchor_height: BlockHeight::from_u32(1),
+                next_executable_after_height: BlockHeight::from_u32(2),
+                expiry_height: BlockHeight::from_u32(3),
             }],
             estimated_duration_hours: 6,
         };
@@ -172,8 +224,8 @@ mod tests {
         let p = MigrationProgress {
             completed_transfers: 2,
             total_transfers: 5,
-            remaining_orchard_zatoshi: 600_000_000,
-            next_transfer_ready_at_height: Some(2_880_864),
+            remaining_orchard: Zatoshis::const_from_u64(600_000_000),
+            next_transfer_ready_at_height: Some(BlockHeight::from_u32(2_880_864)),
         };
         assert_eq!(round_trip(&p), p);
         let none = MigrationProgress {
@@ -184,11 +236,11 @@ mod tests {
     }
 
     #[test]
-    fn prepared_tx_round_trips() {
+    fn prepared_tx_carries_raw_pczt() {
         let tx = PreparedTx {
             id: "t1".to_string(),
             txid: "deadbeef".to_string(),
-            raw_tx: vec![0x05, 0x00, 0xff],
+            raw_pczt: vec![0x50, 0x00, 0xff],
         };
         assert_eq!(round_trip(&tx), tx);
     }
@@ -198,7 +250,7 @@ mod tests {
         let progress = MigrationProgress {
             completed_transfers: 1,
             total_transfers: 3,
-            remaining_orchard_zatoshi: 1,
+            remaining_orchard: Zatoshis::const_from_u64(1),
             next_transfer_ready_at_height: None,
         };
         for state in [

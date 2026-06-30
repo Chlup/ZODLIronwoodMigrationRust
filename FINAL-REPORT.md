@@ -71,3 +71,68 @@ by the `librustzcash-backend` Cargo feature:
   `executeNextPendingTransfer` / `submitNoteSplit` Kotlin methods compose from these (see spec §4.3).
 - Close gap #1 to enable live signing; then a wallet-DB fixture unlocks end-to-end tests for the
   backend tier.
+
+---
+
+# Addendum — Issue #1 changes (branch `feat/issue-1-upstream-alignment`)
+
+Implements the review notes in [Chlup/ZODLIronwoodMigrationRust#1](https://github.com/Chlup/ZODLIronwoodMigrationRust/issues/1).
+Spec: [docs/superpowers/specs/2026-06-30-issue-1-upstream-alignment-pczt-design.md](docs/superpowers/specs/2026-06-30-issue-1-upstream-alignment-pczt-design.md);
+plan: [docs/superpowers/plans/2026-06-30-issue-1-upstream-alignment-pczt.md](docs/superpowers/plans/2026-06-30-issue-1-upstream-alignment-pczt.md).
+
+## Status: complete and verified
+
+- **Builds warning-free** against the valargroup fork under `zcash_unstable="nu6.3"`.
+- **59 tests pass** with the backend; **53** core-only (`--no-default-features`). `cargo fmt --check` clean.
+
+## What changed
+
+- **PCZT pivot (§2.2/§3.1/§4.1/§4.2):** migration txs are now built, persisted, and refreshed as
+  **PCZTs**. `backend::build_signed_pczt` runs propose →
+  `create_pczt_from_proposal_with_tx_version(V6)` → prove (Orchard + Ironwood proving keys) → sign
+  every Orchard spend (the fork's try-all-indices, qleak-safe pattern) → spend-finalize → serialize.
+  `PreparedTx.raw_tx → raw_pczt`. New `extract_broadcast_tx` (PCZT → broadcast bytes) and
+  `MigrationContext::refresh_stale_transfers` (the §4.2 re-anchor/re-prove/re-sign "update proof" op).
+- **Canonical types (§3.2/§4.1/§4.2):** public API uses `zcash_protocol::consensus::Network`,
+  `Zatoshis`, `BlockHeight` (serialized as plain numbers via serde adapters); `MigrationError` is now
+  rich (`Db(rusqlite::Error)`, `Backend(SqliteClientError)`, `Pipeline(String)`,
+  `InvalidState(InvalidStateError)`) with `error_code()` for the FFI; `zcash_protocol` is a required
+  dependency.
+- **`ext_` SQLite schema (§3.4):** tables renamed `ironwood_migration_* → ext_ironwood_migration_*`.
+- **Self-funding denominations (§5):** each prepared note = `power_of_ten + 20_000` (4× ZIP-317
+  marginal fee); any residual/dust is kept in Orchard, never folded into the fee.
+- The §2.1 gap list lives in [docs/UPSTREAM-GAP-ANALYSIS.md](docs/UPSTREAM-GAP-ANALYSIS.md).
+
+## Non-blocking findings (out of scope per the approved spec)
+
+1. **§2.3 — move off the valargroup forks (release requirement).** Not done here (this crate only).
+   The crate's own code ports cheaply (identical dep versions, same API paths, nu6.3 works upstream);
+   the blocker is the wallet-level Ironwood stack upstream still stubs (`ironwood_bundle: None`). See
+   the gap-analysis doc. Tracked as the release gate.
+2. **§3.3 — push functionality into `zcash_client_backend` (maintainership).** Candidates to upstream
+   rather than carry in-crate: the Ironwood balance read and the migration-tx construction. Recorded,
+   not implemented (this-crate-only scope).
+3. **§6.1 — scanner work (platform/librustzcash).** Set `Reference` checkpoint retention for every
+   `height % 288 == 0` block (Orchard **and** Sapling) so a bucketed anchor (≤287 blocks back) is
+   always witnessable; and add a witness-construction retry for when a rescan overwrites a `Reference`
+   leaf. This crate is scan-free, so these belong in the SDK's sync path / `zcash_client_sqlite`
+   scanner. Security-sensitive — get the anchor-retention design reviewed.
+4. **Backend tier is compile-verified, not run** (spec D-verification). The PCZT pipeline compiles
+   against the real APIs; exercising it needs a seeded, synced wallet DB. Specific runtime items to
+   confirm: the **proving-key circuit-version pairing** (`OrchardPostNu6_3` vs `…PreNu6_3` for the
+   spend bundle) and that **no `sign_ironwood` pass is needed** (migration spends are Orchard V2; the
+   Ironwood bundle is output-only).
+5. **`refresh_stale_transfers` regenerates** (re-propose at a fresh bucketed anchor + re-sign) rather
+   than mutating a persisted PCZT's anchor in place via the updater role — a future optimization.
+6. **Proving on mobile.** Building the Orchard + Ironwood `ProvingKey`s (cached in `OnceLock`) is
+   in-memory but non-trivial; if it proves too heavy on device, signing can move to the platform /
+   Keystone (the persisted-PCZT model already supports external signing).
+7. **`NoteSplitProposal` keeps `u64`/`Vec<u64>`** (not `Zatoshis`) — the issue scoped the canonical
+   types to `TransferProposal`/`MigrationProgress`; easy to extend later.
+
+## For the SDK integrators (updated)
+
+- `next_due_transfer()` now returns `PreparedTx { raw_pczt }`. Extract the consensus tx via
+  `extract_broadcast_tx(raw_pczt)` (or your own librustzcash binding), broadcast it, then
+  `record_transfer_result(id, result)`. Persisted PCZTs also enable Keystone signing and proof/anchor
+  refresh (`refresh_stale_transfers`).
