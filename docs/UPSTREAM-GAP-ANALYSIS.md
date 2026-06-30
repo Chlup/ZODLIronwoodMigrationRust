@@ -34,7 +34,10 @@ layer. The **wallet layer** (`zcash_client_backend` / `zcash_client_sqlite`) is 
    that routes Orchard-destined outputs through `add_ironwood_output` → V3 notes
    (`zcash_client_backend/src/data_api/wallet.rs`, +1171). **Upstream forcing V6 changes only the tx
    *format*; its `zcash_primitives` builder hard-codes `ironwood_bundle: None`** ("does not yet
-   construct Ironwood bundles").
+   construct Ironwood bundles"). The V6-forcing PCZT entry
+   `create_pczt_from_proposal_with_tx_version` — which this crate's issue-#1 PCZT pivot now calls — is
+   likewise valargroup-only; upstream has only the base `create_pczt_from_proposal` (no V6 variant) and
+   no `ironwood` references in `wallet.rs` at all.
 3. **Core builder Ironwood construction.** `orchard::BundleProtocol::IronwoodPostNu6_3`,
    `add_ironwood_spend` / `add_ironwood_change_output`, the `ironwood_anchor` in `BuildConfig`, gated
    on `BranchId::Nu6_3` (`zcash_primitives/src/transaction/builder.rs`, +1352).
@@ -71,10 +74,22 @@ ZIP-233). Valargroup's Ironwood code is overwhelmingly `nu6.3`-gated. This crate
 
 ## Port implications (for §2.3 "move off the valargroup forks")
 
-This crate's own code ports cheaply: dependency **versions are identical**, every non-Ironwood API it
-uses resolves at the **same path** upstream, and its `nu6.3` cfg works upstream. The blocker is items
-1–4 above — the **wallet-level Ironwood construction + balance + V3 storage** that upstream
-deliberately stubbed (`ironwood_bundle: None`). The realistic path (§3 "add functionality to
-`zcash_client_backend`", leveraging librustzcash maintainership) is to land that wallet stack
-upstream — adapting it to the newer Orchard 0.15 API — plus a qleak-bearing orchard pin. Once those
-exist upstream, this crate's switch is a Cargo-source change.
+This crate's own code ports cheaply: dependency **versions are identical**, the standard (non-Ironwood)
+APIs it uses resolve at the **same path** upstream, and its `nu6.3` cfg works upstream. The blocker is
+items 1–4 above — the **wallet-level Ironwood construction + balance + V3 storage** that upstream
+deliberately stubs (`zcash_client_backend/.../wallet.rs` has **zero** `ironwood` references;
+`add_ironwood_output`, `orchard_outputs_to_ironwood`, `create_orchard_to_ironwood_transaction`, and the
+V6-forcing `create_pczt_from_proposal_with_tx_version` are all valargroup-only — upstream: 0). The
+realistic path (§3 "add functionality to `zcash_client_backend`", leveraging librustzcash
+maintainership) is to land that wallet stack upstream — adapting it to the newer Orchard 0.15 API —
+plus a qleak-bearing orchard pin. Once those exist upstream, this crate's switch is a Cargo-source change.
+
+**Effect of the issue-#1 PCZT pivot on portability.** It did **not** change the gap (the pivot touched
+the crate, not the forks) and did **not** shrink the blocker — forcing V6 via the PCZT path on upstream
+still yields a V6-formatted *normal-Orchard* tx, because the output-routing + builder construction are
+valargroup-only. It *did* move the crate onto upstream's own trajectory: upstream's Ironwood support is
+deliberately PCZT-centric, and the prove/sign roles the crate now calls (`create_ironwood_proof`,
+`sign_ironwood`) plus the base `create_pczt_from_proposal` already exist upstream. So when upstream grows
+the wallet-level construction, this crate's PCZT approach slots in more naturally than the previous
+`create_proposed_transactions`→raw-tx path would have — the pivot aligned the crate with how the gap is
+most likely to be closed, even though it didn't reduce the gap today.
