@@ -33,7 +33,7 @@ mod scheduling;
 mod state;
 mod store;
 
-pub use error::MigrationError;
+pub use error::{InvalidStateError, MigrationError};
 pub use types::{
     AttentionReason, MigrationProgress, MigrationSchedule, MigrationState, Network,
     NetworkPrivacyOptions, NoteSplitProposal, PreparedTx, TransferProposal, TransferResult,
