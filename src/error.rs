@@ -29,7 +29,10 @@ impl fmt::Display for InvalidStateError {
             InvalidStateError::NoActiveRun => write!(f, "no active migration run"),
             InvalidStateError::UnknownPhase(p) => write!(f, "unknown migration phase: {p}"),
             InvalidStateError::WrongPhase { expected, found } => {
-                write!(f, "wrong migration phase: expected {expected}, found {found}")
+                write!(
+                    f,
+                    "wrong migration phase: expected {expected}, found {found}"
+                )
             }
             InvalidStateError::AlreadyComplete => write!(f, "migration already complete"),
             InvalidStateError::NotApplicable(why) => write!(f, "operation not applicable: {why}"),

@@ -4,8 +4,8 @@
 // transactions by wall-clock schedule; this port stores plaintext blobs (the wallet DB is the
 // app's secure store) and schedules by block height.
 
-//! Persistence of migration runs and pre-signed transactions in additive SQLite tables
-//! (`ironwood_migration_*`) inside the wallet database. Uses `rusqlite` only.
+//! Persistence of migration runs and pre-signed PCZTs (serialized `pczt::Pczt`) in additive tables
+//! (`ext_ironwood_migration_*`) inside the wallet database. Uses `rusqlite` only.
 
 use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,7 +20,7 @@ const TERMINAL_PHASES: [&str; 3] = ["complete", "failed_terminal", "abandoned"];
 
 const RUN_COLUMNS: &str =
     "run_id, account_uuid, network, phase, prep_txid, target_values_json, last_error";
-const PENDING_COLUMNS: &str = "txid_hex, raw_tx, anchor_height, target_height, \
+const PENDING_COLUMNS: &str = "txid_hex, raw_pczt, anchor_height, target_height, \
     next_executable_after_height, expiry_height, value_zatoshi, fee_zatoshi, selected_note_txid, \
     selected_note_output_index, selected_note_value, status, metadata_json";
 
@@ -62,7 +62,7 @@ pub(crate) struct PreparedNote {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PendingTxRow {
     pub txid_hex: String,
-    pub raw_tx: Vec<u8>,
+    pub raw_pczt: Vec<u8>,
     pub anchor_height: u32,
     pub target_height: u32,
     pub next_executable_after_height: u32,
@@ -81,7 +81,7 @@ pub(crate) struct PendingTxRow {
 pub(crate) struct PrepTxRow {
     pub run_id: String,
     pub txid_hex: String,
-    pub raw_tx: Vec<u8>,
+    pub raw_pczt: Vec<u8>,
     pub status: String,
 }
 
@@ -129,7 +129,7 @@ fn map_run_row(row: &rusqlite::Row) -> rusqlite::Result<RunRow> {
 fn map_pending_row(row: &rusqlite::Row) -> rusqlite::Result<PendingTxRow> {
     Ok(PendingTxRow {
         txid_hex: row.get(0)?,
-        raw_tx: row.get(1)?,
+        raw_pczt: row.get(1)?,
         anchor_height: row.get(2)?,
         target_height: row.get(3)?,
         next_executable_after_height: row.get(4)?,
@@ -144,10 +144,10 @@ fn map_pending_row(row: &rusqlite::Row) -> rusqlite::Result<PendingTxRow> {
     })
 }
 
-/// Create the `ironwood_migration_*` tables if they do not yet exist.
+/// Create the `ext_ironwood_migration_*` tables if they do not yet exist.
 pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS ironwood_migration_runs (
+        "CREATE TABLE IF NOT EXISTS ext_ironwood_migration_runs (
             run_id TEXT PRIMARY KEY,
             account_uuid TEXT NOT NULL,
             network TEXT NOT NULL,
@@ -159,9 +159,9 @@ pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
             target_values_json TEXT NOT NULL DEFAULT '[]',
             last_error TEXT
         );
-        CREATE INDEX IF NOT EXISTS idx_ironwood_migration_runs_active
-            ON ironwood_migration_runs(account_uuid, network, phase, created_at_ms);
-        CREATE TABLE IF NOT EXISTS ironwood_migration_prepared_notes (
+        CREATE INDEX IF NOT EXISTS idx_ext_ironwood_migration_runs_active
+            ON ext_ironwood_migration_runs(account_uuid, network, phase, created_at_ms);
+        CREATE TABLE IF NOT EXISTS ext_ironwood_migration_prepared_notes (
             run_id TEXT NOT NULL,
             txid_hex TEXT NOT NULL,
             output_index INTEGER NOT NULL,
@@ -171,16 +171,16 @@ pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
             lock_state TEXT NOT NULL DEFAULT 'locked',
             PRIMARY KEY (run_id, txid_hex, output_index)
         );
-        CREATE TABLE IF NOT EXISTS ironwood_migration_prep_tx (
+        CREATE TABLE IF NOT EXISTS ext_ironwood_migration_prep_tx (
             run_id TEXT PRIMARY KEY,
             txid_hex TEXT NOT NULL,
-            raw_tx BLOB NOT NULL,
+            raw_pczt BLOB NOT NULL,
             status TEXT NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS ironwood_migration_pending_txs (
+        CREATE TABLE IF NOT EXISTS ext_ironwood_migration_pending_txs (
             run_id TEXT NOT NULL,
             txid_hex TEXT PRIMARY KEY,
-            raw_tx BLOB NOT NULL,
+            raw_pczt BLOB NOT NULL,
             anchor_height INTEGER NOT NULL,
             target_height INTEGER NOT NULL,
             next_executable_after_height INTEGER NOT NULL,
@@ -193,8 +193,8 @@ pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
             status TEXT NOT NULL,
             metadata_json TEXT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_ironwood_migration_pending_due
-            ON ironwood_migration_pending_txs(run_id, status, next_executable_after_height);",
+        CREATE INDEX IF NOT EXISTS idx_ext_ironwood_migration_pending_due
+            ON ext_ironwood_migration_pending_txs(run_id, status, next_executable_after_height);",
     )
 }
 
@@ -203,7 +203,7 @@ pub(crate) fn insert_run(conn: &Connection, run: &NewRun) -> rusqlite::Result<()
     let target_values_json = serde_json::to_string(run.target_values)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
     conn.execute(
-        "INSERT INTO ironwood_migration_runs
+        "INSERT INTO ext_ironwood_migration_runs
             (run_id, account_uuid, network, db_fingerprint, phase, created_at_ms, updated_at_ms,
              prep_txid, target_values_json, last_error)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, NULL)",
@@ -226,7 +226,7 @@ pub(crate) fn insert_run(conn: &Connection, run: &NewRun) -> rusqlite::Result<()
 #[allow(dead_code)]
 pub(crate) fn run_by_id(conn: &Connection, run_id: &str) -> rusqlite::Result<Option<RunRow>> {
     conn.query_row(
-        &format!("SELECT {RUN_COLUMNS} FROM ironwood_migration_runs WHERE run_id = ?1"),
+        &format!("SELECT {RUN_COLUMNS} FROM ext_ironwood_migration_runs WHERE run_id = ?1"),
         params![run_id],
         map_run_row,
     )
@@ -240,7 +240,7 @@ pub(crate) fn active_run(
 ) -> rusqlite::Result<Option<RunRow>> {
     conn.query_row(
         &format!(
-            "SELECT {RUN_COLUMNS} FROM ironwood_migration_runs
+            "SELECT {RUN_COLUMNS} FROM ext_ironwood_migration_runs
              WHERE account_uuid = ?1 AND network = ?2 AND phase NOT IN ({})
              ORDER BY created_at_ms DESC LIMIT 1",
             terminal_in_clause()
@@ -258,7 +258,7 @@ pub(crate) fn set_phase(
     last_error: Option<&str>,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "UPDATE ironwood_migration_runs SET phase = ?2, last_error = ?3, updated_at_ms = ?4
+        "UPDATE ext_ironwood_migration_runs SET phase = ?2, last_error = ?3, updated_at_ms = ?4
          WHERE run_id = ?1",
         params![run_id, phase.as_str(), last_error, now_ms()],
     )?;
@@ -272,7 +272,7 @@ pub(crate) fn insert_prepared_notes(
 ) -> rusqlite::Result<()> {
     for n in notes {
         conn.execute(
-            "INSERT OR REPLACE INTO ironwood_migration_prepared_notes
+            "INSERT OR REPLACE INTO ext_ironwood_migration_prepared_notes
                 (run_id, txid_hex, output_index, value_zatoshi, note_version, nullifier_hex, lock_state)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
@@ -295,8 +295,8 @@ pub(crate) fn locked_note_refs(
 ) -> rusqlite::Result<BTreeSet<(String, u32)>> {
     let sql = format!(
         "SELECT lower(pn.txid_hex), pn.output_index
-         FROM ironwood_migration_prepared_notes pn
-         INNER JOIN ironwood_migration_runs r ON r.run_id = pn.run_id
+         FROM ext_ironwood_migration_prepared_notes pn
+         INNER JOIN ext_ironwood_migration_runs r ON r.run_id = pn.run_id
          WHERE r.account_uuid = ?1 AND pn.lock_state = 'locked' AND r.phase NOT IN ({})",
         terminal_in_clause()
     );
@@ -314,15 +314,15 @@ pub(crate) fn insert_pending_txs(
 ) -> rusqlite::Result<()> {
     for t in txs {
         conn.execute(
-            "INSERT OR REPLACE INTO ironwood_migration_pending_txs
-                (run_id, txid_hex, raw_tx, anchor_height, target_height, next_executable_after_height,
+            "INSERT OR REPLACE INTO ext_ironwood_migration_pending_txs
+                (run_id, txid_hex, raw_pczt, anchor_height, target_height, next_executable_after_height,
                  expiry_height, value_zatoshi, fee_zatoshi, selected_note_txid,
                  selected_note_output_index, selected_note_value, status, metadata_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 run_id,
                 t.txid_hex,
-                t.raw_tx,
+                t.raw_pczt,
                 t.anchor_height,
                 t.target_height,
                 t.next_executable_after_height,
@@ -347,7 +347,7 @@ pub(crate) fn next_due_transfer(
 ) -> rusqlite::Result<Option<PendingTxRow>> {
     conn.query_row(
         &format!(
-            "SELECT {PENDING_COLUMNS} FROM ironwood_migration_pending_txs
+            "SELECT {PENDING_COLUMNS} FROM ext_ironwood_migration_pending_txs
              WHERE run_id = ?1 AND status = 'scheduled' AND next_executable_after_height <= ?2
              ORDER BY next_executable_after_height ASC, txid_hex ASC LIMIT 1"
         ),
@@ -363,7 +363,7 @@ pub(crate) fn next_scheduled_send_height(
     run_id: &str,
 ) -> rusqlite::Result<Option<u32>> {
     conn.query_row(
-        "SELECT MIN(next_executable_after_height) FROM ironwood_migration_pending_txs
+        "SELECT MIN(next_executable_after_height) FROM ext_ironwood_migration_pending_txs
          WHERE run_id = ?1 AND status = 'scheduled'",
         params![run_id],
         |row| row.get::<_, Option<u32>>(0),
@@ -376,7 +376,7 @@ pub(crate) fn mark_pending_status(
     status: &str,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "UPDATE ironwood_migration_pending_txs SET status = ?2 WHERE txid_hex = ?1",
+        "UPDATE ext_ironwood_migration_pending_txs SET status = ?2 WHERE txid_hex = ?1",
         params![txid_hex, status],
     )?;
     Ok(())
@@ -385,7 +385,7 @@ pub(crate) fn mark_pending_status(
 pub(crate) fn pending_totals(conn: &Connection, run_id: &str) -> rusqlite::Result<PendingTotals> {
     let mut totals = PendingTotals::default();
     let mut stmt = conn.prepare(
-        "SELECT status, COUNT(*) FROM ironwood_migration_pending_txs WHERE run_id = ?1 GROUP BY status",
+        "SELECT status, COUNT(*) FROM ext_ironwood_migration_pending_txs WHERE run_id = ?1 GROUP BY status",
     )?;
     let rows = stmt.query_map(params![run_id], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
@@ -405,7 +405,7 @@ pub(crate) fn pending_totals(conn: &Connection, run_id: &str) -> rusqlite::Resul
 
 pub(crate) fn clear_scheduled_pending(conn: &Connection, run_id: &str) -> rusqlite::Result<usize> {
     conn.execute(
-        "DELETE FROM ironwood_migration_pending_txs WHERE run_id = ?1 AND status = 'scheduled'",
+        "DELETE FROM ext_ironwood_migration_pending_txs WHERE run_id = ?1 AND status = 'scheduled'",
         params![run_id],
     )
 }
@@ -414,26 +414,26 @@ pub(crate) fn insert_prep_tx(
     conn: &Connection,
     run_id: &str,
     txid_hex: &str,
-    raw_tx: &[u8],
+    raw_pczt: &[u8],
     status: &str,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO ironwood_migration_prep_tx (run_id, txid_hex, raw_tx, status)
+        "INSERT OR REPLACE INTO ext_ironwood_migration_prep_tx (run_id, txid_hex, raw_pczt, status)
          VALUES (?1, ?2, ?3, ?4)",
-        params![run_id, txid_hex, raw_tx, status],
+        params![run_id, txid_hex, raw_pczt, status],
     )?;
     Ok(())
 }
 
 pub(crate) fn prep_tx(conn: &Connection, run_id: &str) -> rusqlite::Result<Option<PrepTxRow>> {
     conn.query_row(
-        "SELECT run_id, txid_hex, raw_tx, status FROM ironwood_migration_prep_tx WHERE run_id = ?1",
+        "SELECT run_id, txid_hex, raw_pczt, status FROM ext_ironwood_migration_prep_tx WHERE run_id = ?1",
         params![run_id],
         |row| {
             Ok(PrepTxRow {
                 run_id: row.get(0)?,
                 txid_hex: row.get(1)?,
-                raw_tx: row.get(2)?,
+                raw_pczt: row.get(2)?,
                 status: row.get(3)?,
             })
         },
@@ -447,7 +447,7 @@ pub(crate) fn set_prep_tx_status(
     status: &str,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "UPDATE ironwood_migration_prep_tx SET status = ?2 WHERE run_id = ?1",
+        "UPDATE ext_ironwood_migration_prep_tx SET status = ?2 WHERE run_id = ?1",
         params![run_id, status],
     )?;
     Ok(())
@@ -461,6 +461,20 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init(&conn).unwrap();
         conn
+    }
+
+    #[test]
+    fn schema_uses_ext_prefix() {
+        let conn = db();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type='table' AND name LIKE 'ext_ironwood_migration_%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 4);
     }
 
     fn sample_run(conn: &Connection, run_id: &str, phase: Phase) {
@@ -493,7 +507,7 @@ mod tests {
     fn pending(txid: &str, send_height: u32, status: &str) -> PendingTxRow {
         PendingTxRow {
             txid_hex: txid.to_string(),
-            raw_tx: vec![1, 2, 3],
+            raw_pczt: vec![1, 2, 3],
             anchor_height: 2_880_000,
             target_height: 1000,
             next_executable_after_height: send_height,
@@ -697,7 +711,7 @@ mod tests {
         insert_prep_tx(&conn, "r1", "txid1", &[9, 9, 9], "pending").unwrap();
         let p = prep_tx(&conn, "r1").unwrap().unwrap();
         assert_eq!(p.txid_hex, "txid1");
-        assert_eq!(p.raw_tx, vec![9, 9, 9]);
+        assert_eq!(p.raw_pczt, vec![9, 9, 9]);
         assert_eq!(p.status, "pending");
         set_prep_tx_status(&conn, "r1", "broadcasted").unwrap();
         assert_eq!(prep_tx(&conn, "r1").unwrap().unwrap().status, "broadcasted");

@@ -103,7 +103,10 @@ mod tests {
     #[test]
     fn each_output_is_power_of_ten_plus_self_funding_buffer() {
         let plan = plan_denominations(1_234_500_000, 0).unwrap();
-        assert_eq!(plan.crossing_values, vec![1_000_000_000, 100_000_000, 100_000_000]);
+        assert_eq!(
+            plan.crossing_values,
+            vec![1_000_000_000, 100_000_000, 100_000_000]
+        );
         assert_eq!(
             plan.migration_outputs,
             vec![1_000_020_000, 100_020_000, 100_020_000]
