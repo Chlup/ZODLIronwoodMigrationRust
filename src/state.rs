@@ -99,6 +99,8 @@ pub(crate) fn to_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zcash_protocol::consensus::BlockHeight;
+    use zcash_protocol::value::Zatoshis;
 
     const ALL_PHASES: [Phase; 14] = [
         Phase::NoOrchardFunds,
@@ -121,8 +123,8 @@ mod tests {
         MigrationProgress {
             completed_transfers: 1,
             total_transfers: 3,
-            remaining_orchard_zatoshi: 600_000_000,
-            next_transfer_ready_at_height: Some(2_880_864),
+            remaining_orchard: Zatoshis::const_from_u64(600_000_000),
+            next_transfer_ready_at_height: Some(BlockHeight::from_u32(2_880_864)),
         }
     }
 
