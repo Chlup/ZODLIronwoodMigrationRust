@@ -16,8 +16,10 @@
 //!
 //! ## Layering
 //!
-//! * **core** (always compiled, valargroup-free): [`types`], [`error`], `denominations`,
-//!   `scheduling`, `state`, `store`, `network`. Fully unit-tested.
+//! * **core** (always compiled): [`types`], [`error`], `denominations`, `scheduling`, `state`,
+//!   `store`. Depends only on the lightweight `zcash_protocol` for the canonical
+//!   `Network`/`Zatoshis`/`BlockHeight` types; the heavy backend crates stay optional.
+//!   Fully unit-tested.
 //! * **backend** (behind the `librustzcash-backend` feature): the `ReservedInputSource`
 //!   adapter, the propose/sign/balance calls against `zcash_client_sqlite::WalletDb`, and
 //!   the [`MigrationContext`] facade. Compiled against the valargroup librustzcash fork.
