@@ -2576,15 +2576,11 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 name = "zodl_ironwood_migration"
 version = "0.1.0"
 dependencies = [
- "bls12_381",
  "hex",
- "jubjub",
  "orchard",
  "pczt",
  "rand",
- "rand_core",
  "rusqlite",
- "sapling-crypto",
  "serde",
  "serde_json",
  "tempfile",

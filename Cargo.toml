@@ -22,10 +22,6 @@ librustzcash-backend = [
     "dep:zip321",
     "dep:orchard",
     "dep:pczt",
-    "dep:sapling-crypto",
-    "dep:jubjub",
-    "dep:bls12_381",
-    "dep:rand_core",
     "dep:rand",
     "dep:uuid",
 ]
@@ -62,11 +58,6 @@ zcash_proofs = { version = "0.28", git = "https://github.com/valargroup/librustz
 # zcash_client_backend's `pczt` feature enables, plus `orchard`.
 pczt = { version = "0.7", git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts", default-features = false, features = ["orchard", "io-finalizer", "prover", "signer", "spend-finalizer", "tx-extractor", "zcp-builder"], optional = true }
 orchard = { version = "0.14", git = "https://github.com/zcash/orchard", branch = "adam/qleak-dummy-ciphertexts-on-pr505", default-features = false, features = ["circuit"], optional = true }
-# Needed to port vizor's no-op Sapling provers (Orchard-only migration txs never invoke them).
-sapling-crypto = { version = "0.7", default-features = false, optional = true }
-jubjub = { version = "0.10", optional = true }
-bls12_381 = { version = "0.8", optional = true }
-rand_core = { version = "0.6", optional = true }
 rand = { version = "0.8", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
 
