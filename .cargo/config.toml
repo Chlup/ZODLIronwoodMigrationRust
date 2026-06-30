@@ -1,0 +1,6 @@
+# The valargroup librustzcash fork gates the entire Ironwood wallet layer behind
+# `zcash_unstable = "nu6.3"` (NOT "nu7" — see the design spec, decision D1). This
+# rustflag applies to the whole build graph, including the git-pinned valargroup
+# crates, so the Ironwood APIs compile in. It is harmless for the core-only build.
+[build]
+rustflags = ["--cfg", "zcash_unstable=\"nu6.3\""]
