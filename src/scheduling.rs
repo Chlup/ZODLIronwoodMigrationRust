@@ -1,19 +1,23 @@
-//! Height-based anchor bucketing and migration-transfer scheduling (the piece vizor does
-//! not provide; vizor de-correlates by time, the app contract is height-based).
+//! Migration-transfer scheduling: give each output amount a send window and expiry (the piece
+//! vizor does not provide; vizor de-correlates by time, the app contract is height-based).
 //!
-//! All transfers in a schedule share one **bucketed anchor** (`floor(natural_anchor / 288) *
-//! 288`), which is network-wide for the ~6-hour window — this hides the wallet's last sync
-//! time. De-correlation between a wallet's own transfers comes from staggered send heights
-//! (`next_executable_after_height`, one bucket apart) and distinct expiry heights. The first
-//! privacy-path transfer is delayed one bucket so it does not correlate with the moment the
-//! user confirmed the schedule. See the design spec §6.
+//! All transfers in a schedule share one **anchor** — the wallet's natural anchor from
+//! `get_target_and_anchor_heights`. De-correlation between a wallet's own transfers comes from
+//! staggered send heights (`next_executable_after_height`, one bucket apart) and distinct expiry
+//! heights. The first privacy-path transfer is delayed one bucket so it does not correlate with the
+//! moment the user confirmed the schedule. See the design spec §6.
+//!
+//! NOTE: an earlier design floored the anchor to a shared network-wide 288-block bucket
+//! (`floor(natural_anchor / 288) * 288`) to hide the wallet's last sync time. That cannot work
+//! against the SDK as-is: `create_pczt` requires a note-commitment-tree checkpoint at the *exact*
+//! anchor height, but the wallet only checkpoints at ~100-block scan-batch boundaries, so an
+//! arbitrary 288-aligned height is essentially never witnessable (→ `AnchorNotFound`). Reinstating
+//! the shared bucket requires the SDK to persist a checkpoint at every 288-boundary during scan.
 
 use crate::types::{MigrationSchedule, TransferProposal};
 use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::value::Zatoshis;
 
-/// Width of an anchor bucket, in blocks (~6 hours at ~75 s/block).
-pub(crate) const ANCHOR_BUCKET_SIZE: u32 = 288;
 /// Blocks between successive transfers' send windows.
 pub(crate) const TRANSFER_CADENCE_BLOCKS: u32 = 288;
 /// Delay (blocks) before the first privacy-path transfer may broadcast.
@@ -23,15 +27,10 @@ pub(crate) const TRANSFER_EXPIRY_WINDOW_BLOCKS: u32 = 288;
 /// Approximate blocks per hour (~75 s/block).
 pub(crate) const BLOCKS_PER_HOUR: u32 = 48;
 
-/// Floor a natural anchor height to its shared network-wide bucket. The result is always
-/// `<= natural_anchor` (an anchor in the past, so the note is witnessable now).
-pub(crate) fn bucket_anchor(natural_anchor: u32) -> u32 {
-    (natural_anchor / ANCHOR_BUCKET_SIZE) * ANCHOR_BUCKET_SIZE
-}
-
 /// Build a migration schedule mapping each output `amount` (zatoshi) to a `TransferProposal`.
 ///
-/// All transfers share `bucket_anchor(natural_anchor)`. Transfer `i` may broadcast at
+/// All transfers share `natural_anchor` — a real, witnessable note-commitment-tree checkpoint (see
+/// the module note on why this is not bucketed). Transfer `i` may broadcast at
 /// `target_height + first_delay_blocks + i * TRANSFER_CADENCE_BLOCKS` and expires
 /// `TRANSFER_EXPIRY_WINDOW_BLOCKS` later. Pass `first_delay_blocks = FIRST_TRANSFER_DELAY_BLOCKS`
 /// for the privacy path, or `0` for an immediate single transfer.
@@ -42,7 +41,7 @@ pub(crate) fn build_schedule(
     natural_anchor: u32,
     first_delay_blocks: u32,
 ) -> MigrationSchedule {
-    let anchor_height = BlockHeight::from_u32(bucket_anchor(natural_anchor));
+    let anchor_height = BlockHeight::from_u32(natural_anchor);
     let transfers = amounts
         .iter()
         .enumerate()
@@ -83,23 +82,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bucket_anchor_floors_to_multiple_of_288() {
-        assert_eq!(bucket_anchor(2_880_000), 2_880_000); // exact multiple
-        assert_eq!(bucket_anchor(2_880_287), 2_880_000); // just below the next bucket
-        assert_eq!(bucket_anchor(2_880_288), 2_880_288); // exactly the next bucket
-        assert_eq!(bucket_anchor(100), 0);
-        assert_eq!(bucket_anchor(0), 0);
-    }
-
-    #[test]
-    fn bucket_anchor_never_exceeds_input_and_is_aligned() {
-        for h in [1u32, 287, 288, 289, 1_000_000, 2_500_001] {
-            assert!(bucket_anchor(h) <= h);
-            assert_eq!(bucket_anchor(h) % ANCHOR_BUCKET_SIZE, 0);
-        }
-    }
-
-    #[test]
     fn schedule_is_empty_for_no_amounts() {
         let s = build_schedule("run", &[], 1000, 2000, FIRST_TRANSFER_DELAY_BLOCKS);
         assert!(s.transfers.is_empty());
@@ -107,7 +89,7 @@ mod tests {
     }
 
     #[test]
-    fn schedule_shares_one_bucketed_anchor_across_transfers() {
+    fn schedule_shares_one_natural_anchor_across_transfers() {
         let s = build_schedule(
             "run",
             &[10, 20, 30],
@@ -120,7 +102,9 @@ mod tests {
             .iter()
             .map(|t| u32::from(t.anchor_height))
             .collect();
-        assert_eq!(anchors, vec![2_880_288, 2_880_288, 2_880_288]);
+        // The anchor is the wallet's real (witnessable) natural anchor, used verbatim — NOT floored
+        // to a 288-bucket (which would land on a height the wallet never checkpointed).
+        assert_eq!(anchors, vec![2_880_290, 2_880_290, 2_880_290]);
     }
 
     #[test]
