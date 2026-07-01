@@ -248,6 +248,26 @@ impl<P: Parameters + Clone> MigrationContext<P> {
         ))
     }
 
+    /// Propose the immediate (single-transaction) migration: sweep the entire spendable Orchard
+    /// balance into one Ironwood output, executable now. Unlike the private path there is no
+    /// denomination and no note split — the whole balance (minus the transaction fee) crosses in a
+    /// single transfer. Returns an empty schedule when nothing is migratable.
+    pub fn propose_immediate_migration_transfers(&self) -> Result<MigrationSchedule, MigrationError> {
+        let db = self.open_wallet()?;
+        let account = backend::account_uuid(self.account_uuid);
+        let (target, anchor) = backend::target_and_anchor(&db)?;
+        let crossing = backend::sweep_crossing_value(&db, &self.network, account)?;
+        let run_id = new_run_id();
+        let amounts = crossing.map(|value| vec![value]).unwrap_or_default();
+        Ok(scheduling::build_schedule(
+            &run_id,
+            &amounts,
+            target,
+            anchor,
+            0, // immediate: executable now, no first-transfer privacy delay
+        ))
+    }
+
     /// Pre-sign and persist every transfer in the schedule, each at its bucketed anchor.
     pub fn sign_and_store_migration_schedule(
         &self,

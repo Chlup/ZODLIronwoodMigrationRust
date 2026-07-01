@@ -17,7 +17,9 @@ use std::sync::OnceLock;
 use rand::rngs::OsRng;
 use uuid::Uuid;
 use zcash_address::ZcashAddress;
-use zcash_client_backend::data_api::wallet::input_selection::{GreedyInputSelector, InputSelector};
+use zcash_client_backend::data_api::wallet::input_selection::{
+    GreedyInputSelector, InputSelector, InputSelectorError,
+};
 use zcash_client_backend::data_api::wallet::{
     create_pczt_from_proposal_with_tx_version, ConfirmationsPolicy, TargetHeight,
 };
@@ -168,6 +170,73 @@ pub(crate) fn propose_migration_transfer<'a, P: Parameters>(
             Some(TxVersion::V6),
         )
         .map_err(|e| MigrationError::Pipeline(format!("propose migration transfer: {e}")))
+}
+
+/// The exact "migrate everything" crossing value for the immediate (single-transaction) path: the
+/// whole spendable Orchard balance minus the fee to spend all of it into one Ironwood output.
+///
+/// Unlike the private path there is no note split to self-fund the fee, so the single sweep transfer
+/// must account for the fee up front. We let the input selector compute it rather than estimating:
+/// a request for the *entire* balance forces every note to be selected and fails with
+/// `InsufficientFunds { required = total + fee }`, so `fee = required - available` and the crossing
+/// value is `total - fee`. Returns `None` when nothing is migratable (balance at or below the fee).
+pub(crate) fn sweep_crossing_value<P: Parameters>(
+    db: &Db<P>,
+    network: &P,
+    account: AccountUuid,
+) -> Result<Option<u64>, MigrationError> {
+    let total = pool_balances(db, account)?.orchard_spendable;
+    if total == 0 {
+        return Ok(None);
+    }
+    let (target, anchor) = db
+        .get_target_and_anchor_heights(ConfirmationsPolicy::default().trusted())?
+        .ok_or(MigrationError::NotSynced)?;
+
+    let request = self_payment_request(db, network, account, total)?;
+    let reserved: BTreeSet<ReceivedNoteId> = BTreeSet::new();
+    let locks: BTreeSet<(String, u32)> = BTreeSet::new();
+    let reserved_db = ReservedInputSource {
+        inner: db,
+        reserved: &reserved,
+        migration_locks: &locks,
+    };
+    let change_strategy =
+        MultiOutputChangeStrategy::<Zip317FeeRule, ReservedInputSource<'_, Db<P>>>::new(
+            Zip317FeeRule::standard(),
+            None,
+            ShieldedProtocol::Orchard,
+            DustOutputPolicy::default(),
+            SplitPolicy::single_output(),
+        );
+    let input_selector = GreedyInputSelector::<ReservedInputSource<'_, Db<P>>>::new();
+
+    let fee = match input_selector.propose_transaction(
+        network,
+        &reserved_db,
+        target,
+        anchor,
+        ConfirmationsPolicy::default(),
+        account,
+        request,
+        &change_strategy,
+        Some(TxVersion::V6),
+    ) {
+        // The whole balance is already proposable (fee somehow covered) — read the actual fee.
+        Ok(proposal) => u64::from(proposal.steps().last().balance().fee_required()),
+        // Expected: requesting the whole balance falls exactly `fee` short of covering itself.
+        Err(InputSelectorError::InsufficientFunds {
+            available,
+            required,
+        }) => u64::from(required).saturating_sub(u64::from(available)),
+        Err(e) => {
+            return Err(MigrationError::Pipeline(format!(
+                "immediate sweep probe: {e}"
+            )))
+        }
+    };
+
+    Ok(total.checked_sub(fee).filter(|crossing| *crossing > 0))
 }
 
 /// Drive the full PCZT pipeline for a proposal: create the PCZT at V6, prove the Orchard and
