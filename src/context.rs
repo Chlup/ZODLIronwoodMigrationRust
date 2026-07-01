@@ -109,6 +109,24 @@ impl<P: Parameters + Clone> MigrationContext<P> {
             .map(attention_from_error)
             .filter(|_| matches!(phase, Phase::FailedRecoverable | Phase::FailedTerminal));
         let mapped = state::to_state(phase, progress, attention);
+        // Denomination-split confirmation: the split has no explicit confirmation callback, so
+        // advance to ReadyToPropose once its (prep) transaction is mined — the resulting notes are
+        // then spendable by the subsequent propose. Covers `PreparingDenominations` (so a broadcast
+        // whose result wasn't recorded still advances) and `WaitingDenomConfirmations`. A prep tx
+        // that isn't mined yet (signed-only or still in the mempool) is `is_tx_mined == false`, so a
+        // not-yet-broadcast split never advances prematurely. Mirrors the `Complete` override below.
+        if matches!(
+            phase,
+            Phase::PreparingDenominations | Phase::WaitingDenomConfirmations
+        ) {
+            if let Some(prep) = store::prep_tx(&conn, &run.run_id)? {
+                let db = self.open_wallet()?;
+                if backend::is_tx_mined(&db, &prep.txid_hex)? {
+                    store::set_phase(&conn, &run.run_id, Phase::ReadyToMigrate, None)?;
+                    return Ok(MigrationState::ReadyToPropose);
+                }
+            }
+        }
         // Completion: an in-progress run whose transfers are all confirmed, with the Orchard
         // balance fully migrated into Ironwood.
         if let MigrationState::InProgress(p) = &mapped {

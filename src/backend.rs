@@ -97,6 +97,31 @@ pub(crate) fn pool_balances<P: Parameters>(
     })
 }
 
+/// Parse a display-order (big-endian) txid hex string back into a `TxId` (internal little-endian).
+fn txid_from_display_hex(hex: &str) -> Option<TxId> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    bytes.reverse(); // display order -> internal order
+    Some(TxId::from_bytes(bytes))
+}
+
+/// Whether the wallet has mined the transaction with the given display-order txid. Used to detect
+/// that the denomination-split (prep) transaction has confirmed, so the migration can proceed.
+pub(crate) fn is_tx_mined<P: Parameters>(
+    db: &Db<P>,
+    txid_display_hex: &str,
+) -> Result<bool, MigrationError> {
+    let Some(txid) = txid_from_display_hex(txid_display_hex) else {
+        return Ok(false);
+    };
+    Ok(db.get_tx_height(txid)?.is_some())
+}
+
 /// Read the current target height and the wallet's natural (spendable) anchor height.
 pub(crate) fn target_and_anchor<P: Parameters>(db: &Db<P>) -> Result<(u32, u32), MigrationError> {
     let (target, anchor) = db
