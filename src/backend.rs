@@ -31,7 +31,7 @@ use zcash_client_sqlite::{AccountUuid, ReceivedNoteId, WalletDb};
 use zcash_keys::keys::{Era, UnifiedAddressRequest, UnifiedSpendingKey};
 use zcash_primitives::transaction::fees::zip317::FeeRule as Zip317FeeRule;
 use zcash_primitives::transaction::{TxId, TxVersion};
-use zcash_protocol::consensus::{self, BlockHeight, Parameters};
+use zcash_protocol::consensus::{BlockHeight, Parameters};
 use zcash_protocol::value::Zatoshis;
 use zcash_protocol::ShieldedProtocol;
 use zip321::{Payment, TransactionRequest};
@@ -39,10 +39,10 @@ use zip321::{Payment, TransactionRequest};
 use crate::error::MigrationError;
 use crate::reserved_source::ReservedInputSource;
 use crate::store;
-use crate::types::Network;
 
-/// The concrete wallet database handle the backend operates on.
-pub(crate) type Db = WalletDb<rusqlite::Connection, consensus::Network, SystemClock, OsRng>;
+/// The wallet database handle the backend operates on, generic over the consensus [`Parameters`] `P`
+/// (so it works for standard Mainnet/Testnet and for a custom network with runtime activation heights).
+pub(crate) type Db<P> = WalletDb<rusqlite::Connection, P, SystemClock, OsRng>;
 
 /// Spendable Orchard balance and total Ironwood balance (zatoshi) for an account.
 pub(crate) struct PoolBalances {
@@ -68,15 +68,18 @@ pub(crate) fn parse_usk(bytes: &[u8]) -> Result<UnifiedSpendingKey, MigrationErr
         .map_err(|e| MigrationError::Pipeline(format!("invalid unified spending key: {e:?}")))
 }
 
-/// Open the wallet database at `db_path`. `Network` is `zcash_protocol::consensus::Network`, the
-/// same type the [`Db`] is parameterised by, so it is passed straight through.
-pub(crate) fn open_wallet(db_path: &str, network: Network) -> Result<Db, MigrationError> {
+/// Open the wallet database at `db_path` with consensus parameters `network` (any [`Parameters`] impl:
+/// standard Mainnet/Testnet or a custom network). Passed straight through to [`WalletDb`].
+pub(crate) fn open_wallet<P: Parameters>(db_path: &str, network: P) -> Result<Db<P>, MigrationError> {
     WalletDb::for_path(db_path, network, SystemClock, OsRng)
         .map_err(|e| MigrationError::Pipeline(format!("open wallet: {e:?}")))
 }
 
 /// Read the spendable Orchard and total Ironwood balances for `account`.
-pub(crate) fn pool_balances(db: &Db, account: AccountUuid) -> Result<PoolBalances, MigrationError> {
+pub(crate) fn pool_balances<P: Parameters>(
+    db: &Db<P>,
+    account: AccountUuid,
+) -> Result<PoolBalances, MigrationError> {
     let summary = db
         .get_wallet_summary(ConfirmationsPolicy::default())?
         .ok_or(MigrationError::NotSynced)?;
@@ -93,7 +96,7 @@ pub(crate) fn pool_balances(db: &Db, account: AccountUuid) -> Result<PoolBalance
 }
 
 /// Read the current target height and the wallet's natural (spendable) anchor height.
-pub(crate) fn target_and_anchor(db: &Db) -> Result<(u32, u32), MigrationError> {
+pub(crate) fn target_and_anchor<P: Parameters>(db: &Db<P>) -> Result<(u32, u32), MigrationError> {
     let (target, anchor) = db
         .get_target_and_anchor_heights(ConfirmationsPolicy::default().trusted())?
         .ok_or(MigrationError::NotSynced)?;
@@ -128,9 +131,9 @@ fn ironwood_proving_key() -> &'static orchard::circuit::ProvingKey {
 /// Propose a single migration transfer: spend reserved notes (excluding locked ones) at the
 /// bucket-aligned `anchor` and emit one Ironwood (V6) output described by `request`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn propose_migration_transfer<'a>(
-    db: &'a Db,
-    network: &consensus::Network,
+pub(crate) fn propose_migration_transfer<'a, P: Parameters>(
+    db: &'a Db<P>,
+    network: &P,
     account: AccountUuid,
     request: TransactionRequest,
     reserved: &'a BTreeSet<ReceivedNoteId>,
@@ -144,14 +147,14 @@ pub(crate) fn propose_migration_transfer<'a>(
         migration_locks,
     };
     let change_strategy =
-        MultiOutputChangeStrategy::<Zip317FeeRule, ReservedInputSource<'a, Db>>::new(
+        MultiOutputChangeStrategy::<Zip317FeeRule, ReservedInputSource<'a, Db<P>>>::new(
             Zip317FeeRule::standard(),
             None,
             ShieldedProtocol::Orchard,
             DustOutputPolicy::default(),
             SplitPolicy::single_output(),
         );
-    let input_selector = GreedyInputSelector::<ReservedInputSource<'a, Db>>::new();
+    let input_selector = GreedyInputSelector::<ReservedInputSource<'a, Db<P>>>::new();
     input_selector
         .propose_transaction(
             network,
@@ -170,9 +173,9 @@ pub(crate) fn propose_migration_transfer<'a>(
 /// Drive the full PCZT pipeline for a proposal: create the PCZT at V6, prove the Orchard and
 /// Ironwood bundles, software-sign every Orchard spend with the USK's spend-authorizing key, and
 /// serialize. Returns the serialized signed PCZT plus the extracted transaction id.
-pub(crate) fn build_signed_pczt(
-    db: &mut Db,
-    network: &consensus::Network,
+pub(crate) fn build_signed_pczt<P: Parameters>(
+    db: &mut Db<P>,
+    network: &P,
     account: AccountUuid,
     usk: &UnifiedSpendingKey,
     proposal: &Proposal<Zip317FeeRule, ReceivedNoteId>,
@@ -270,9 +273,9 @@ fn build_self_payment(
 
 /// Build a zip321 request paying `amount` to the account's own current unified address (Ironwood
 /// addresses equal the existing Orchard/unified address, so the migration is a self-send).
-fn self_payment_request(
-    db: &Db,
-    network: &consensus::Network,
+fn self_payment_request<P: Parameters>(
+    db: &Db<P>,
+    network: &P,
     account: AccountUuid,
     amount: u64,
 ) -> Result<TransactionRequest, MigrationError> {
@@ -319,10 +322,10 @@ fn pending_row(t: &crate::types::TransferProposal, signed: &SignedPczt) -> store
 /// Build a signed-PCZT for every scheduled transfer at its bucketed anchor and persist it as a
 /// pending tx.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn sign_schedule(
-    db: &mut Db,
+pub(crate) fn sign_schedule<P: Parameters>(
+    db: &mut Db<P>,
     conn: &rusqlite::Connection,
-    network: &consensus::Network,
+    network: &P,
     account: AccountUuid,
     usk: &UnifiedSpendingKey,
     run_id: &str,
@@ -356,10 +359,10 @@ pub(crate) fn sign_schedule(
 /// Build, sign (as a PCZT), and persist the note-split (denomination prep) transaction: one
 /// self-send creating the planned output denominations.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn sign_split(
-    db: &mut Db,
+pub(crate) fn sign_split<P: Parameters>(
+    db: &mut Db<P>,
     conn: &rusqlite::Connection,
-    network: &consensus::Network,
+    network: &P,
     account: AccountUuid,
     usk: &UnifiedSpendingKey,
     run_id: &str,

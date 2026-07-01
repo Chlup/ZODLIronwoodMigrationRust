@@ -8,7 +8,7 @@
 
 use rusqlite::Connection;
 use uuid::Uuid;
-use zcash_protocol::consensus::BlockHeight;
+use zcash_protocol::consensus::{BlockHeight, NetworkType, Parameters};
 use zcash_protocol::value::Zatoshis;
 
 use crate::backend::{self, Db};
@@ -18,8 +18,8 @@ use crate::scheduling;
 use crate::state::{self, Phase};
 use crate::store;
 use crate::types::{
-    AttentionReason, MigrationProgress, MigrationSchedule, MigrationState, Network,
-    NoteSplitProposal, PreparedTx, TransferResult,
+    AttentionReason, MigrationProgress, MigrationSchedule, MigrationState, NoteSplitProposal,
+    PreparedTx, TransferResult,
 };
 
 /// ZIP-317 single-action fee estimate (zatoshi) used by note-split / migration planning.
@@ -27,18 +27,18 @@ const FEE_ESTIMATE_ZATOSHI: u64 = 10_000;
 
 /// Holds wallet context for migration operations (mirrors how `libzcashlc` passes a db path +
 /// network + account uuid). Open and operate per call; no shared mutable state.
-pub struct MigrationContext {
+pub struct MigrationContext<P> {
     db_path: String,
-    network: Network,
+    network: P,
     account_uuid: [u8; 16],
 }
 
-impl MigrationContext {
+impl<P: Parameters + Clone> MigrationContext<P> {
     /// Create a context bound to a wallet database, network, and account, ensuring the engine's
     /// SQLite tables exist.
     pub fn new(
         db_path: &str,
-        network: Network,
+        network: P,
         account_uuid: [u8; 16],
     ) -> Result<Self, MigrationError> {
         let ctx = Self {
@@ -59,8 +59,8 @@ impl MigrationContext {
         Ok(conn)
     }
 
-    fn open_wallet(&self) -> Result<Db, MigrationError> {
-        backend::open_wallet(&self.db_path, self.network)
+    fn open_wallet(&self) -> Result<Db<P>, MigrationError> {
+        backend::open_wallet(&self.db_path, self.network.clone())
     }
 
     fn account_str(&self) -> String {
@@ -68,9 +68,10 @@ impl MigrationContext {
     }
 
     fn network_str(&self) -> &'static str {
-        match self.network {
-            Network::MainNetwork => "main",
-            Network::TestNetwork => "test",
+        match self.network.network_type() {
+            NetworkType::Main => "main",
+            NetworkType::Test => "test",
+            NetworkType::Regtest => "regtest",
         }
     }
 
@@ -458,7 +459,7 @@ mod tests {
     fn ctx() -> (NamedTempFile, MigrationContext) {
         let file = NamedTempFile::new().unwrap();
         let path = file.path().to_str().unwrap().to_string();
-        let ctx = MigrationContext::new(&path, Network::MainNetwork, [7u8; 16]).unwrap();
+        let ctx = MigrationContext::new(&path, crate::types::Network::MainNetwork, [7u8; 16]).unwrap();
         (file, ctx)
     }
 
