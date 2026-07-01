@@ -176,14 +176,27 @@ pub(crate) fn propose_migration_transfer<'a, P: Parameters>(
         reserved,
         migration_locks,
     };
-    let change_strategy =
-        MultiOutputChangeStrategy::<Zip317FeeRule, ReservedInputSource<'a, Db<P>>>::new(
-            Zip317FeeRule::standard(),
-            None,
-            ShieldedProtocol::Orchard,
-            DustOutputPolicy::default(),
-            SplitPolicy::single_output(),
-        );
+    let change_strategy = {
+        let base =
+            MultiOutputChangeStrategy::<Zip317FeeRule, ReservedInputSource<'a, Db<P>>>::new(
+                Zip317FeeRule::standard(),
+                None,
+                ShieldedProtocol::Orchard,
+                DustOutputPolicy::default(),
+                SplitPolicy::single_output(),
+            );
+        // A `V5` (note split) transaction keeps its Orchard outputs in the legacy pre-NU6.3 pool,
+        // where each spend/output takes its own action (cross-address disabled). Without this flag
+        // the change strategy assumes post-NU6.3 Ironwood outputs (cross-address `max`), so its fee
+        // estimate disagrees with the V5 build and the builder rejects the leftover as
+        // `ChangeRequired`. `V6` migration transfers legitimately cross into Ironwood, so they keep
+        // the default.
+        if matches!(tx_version, TxVersion::V5) {
+            base.with_legacy_orchard_change()
+        } else {
+            base
+        }
+    };
     let input_selector = GreedyInputSelector::<ReservedInputSource<'a, Db<P>>>::new();
     input_selector
         .propose_transaction(
