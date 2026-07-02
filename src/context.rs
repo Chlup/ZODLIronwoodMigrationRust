@@ -192,14 +192,24 @@ impl<P: Parameters + Clone> MigrationContext<P> {
     }
 
     /// Compute the optimal note split for the spendable Orchard balance. Each output note is
-    /// self-funding (`power_of_ten + buffer`); any residual stays in Orchard.
+    /// self-funding (`power_of_ten + buffer`); any residual stays in Orchard. The reported fee is
+    /// the exact ZIP-317 fee for the split transaction (`5000 × (spends + outputs)`, floored at 2
+    /// actions); at signing time the last output absorbs any drift between this plan and the
+    /// then-current balance.
     pub fn prepare_note_split(&self) -> Result<NoteSplitProposal, MigrationError> {
         let total = self.orchard_spendable()?;
         let plan =
             plan_denominations(total, FEE_ESTIMATE_ZATOSHI).map_err(MigrationError::Pipeline)?;
+        // Pre-split there are no migration locks yet, so no exclusions apply.
+        let db = self.open_wallet()?;
+        let locks = std::collections::BTreeSet::new();
+        let n_spends =
+            crate::split::select_spendable_v2_notes(&db, backend::account_uuid(self.account_uuid), &locks)?
+                .len()
+                .max(1);
         Ok(NoteSplitProposal {
-            output_notes: plan.migration_outputs,
-            fee: plan.prep_fee_zatoshi,
+            output_notes: plan.migration_outputs.clone(),
+            fee: crate::split::split_fee(n_spends, plan.migration_outputs.len()),
         })
     }
 
