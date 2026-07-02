@@ -1,19 +1,26 @@
-// Note split via same-address V2 change outputs (design spec
-// docs/superpowers/specs/2026-07-02-note-split-same-address-change-design.md, zodl-ios repo).
+// Direct transaction building for the migration — the note split AND the pre-signed transfers —
+// on the public `zcash_primitives::transaction::builder::Builder`, bypassing the fork's
+// `create_pczt_from_proposal` where it cannot express what the migration needs:
 //
-// Post-NU6.3 the `OrchardPostNu6_3` protocol disables cross-address transfers: payment outputs are
-// rejected (`CrossAddressDisabled`), but the orchard builder sanctions any number of
-// wallet-controlled **change** outputs, each paired with a fabricated zero-value spend at the
-// change's own address. The fork's `create_pczt_from_proposal` routes all V6 Orchard-destined
-// outputs (payments AND change) to Ironwood, so this module drives the public
-// `zcash_primitives::transaction::builder::Builder` directly instead.
+// - **Note split** (design spec docs/superpowers/specs/2026-07-02-note-split-same-address-change-
+//   design.md, zodl-ios repo): post-NU6.3 the `OrchardPostNu6_3` protocol disables cross-address
+//   transfers — payment outputs are rejected (`CrossAddressDisabled`), but the orchard builder
+//   sanctions any number of wallet-controlled **change** outputs, each paired with a fabricated
+//   zero-value spend at the change's own address. `create_pczt_from_proposal` routes all V6
+//   Orchard-destined outputs (payments AND change) to Ironwood, so the split builds directly.
+// - **Migration transfers**: the pre-signed schedule requires each transaction's consensus expiry
+//   (`nExpiryHeight`) to cover its send window (window start + 288 blocks), but
+//   `create_pczt_from_proposal` hard-codes the builder default (target + 40 blocks), which expires
+//   every pre-signed transfer hours before its window. The transfer builds directly and sets the
+//   expiry via `Builder::with_expiry_height`.
 
 use std::collections::BTreeSet;
 
 use rand::rngs::OsRng;
 use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
 use zcash_client_backend::data_api::{InputSource, TargetValue, WalletCommitmentTrees, WalletRead};
-use zcash_client_backend::wallet::ReceivedNote;
+use zcash_client_backend::proposal::Proposal;
+use zcash_client_backend::wallet::{Note, ReceivedNote};
 use zcash_client_sqlite::{AccountUuid, ReceivedNoteId};
 use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_primitives::transaction::builder::{BuildConfig, Builder};
@@ -21,7 +28,7 @@ use zcash_primitives::transaction::fees::zip317::FeeRule as Zip317FeeRule;
 use zcash_protocol::consensus::{BlockHeight, Parameters};
 use zcash_protocol::memo::MemoBytes;
 use zcash_protocol::value::Zatoshis;
-use zcash_protocol::ShieldedProtocol;
+use zcash_protocol::{PoolType, ShieldedProtocol};
 
 use crate::backend::Db;
 use crate::error::MigrationError;
@@ -234,6 +241,149 @@ pub(crate) fn build_split_pczt<P: Parameters>(
         .map_err(|e| MigrationError::Pipeline(format!("note split: io finalize: {e:?}")))?;
 
     Ok((finalized, placed))
+}
+
+/// Build one migration transfer as an unproven PCZT with a **real consensus expiry**: spend the
+/// proposal's selected Orchard V2 notes, cross `crossing_zatoshi` into one Ironwood V3 output at
+/// the wallet's own address, and route the proposal's change to Ironwood (the fork's post-NU6.3
+/// change policy). `expiry_height` becomes the transaction's `nExpiryHeight`, so a pre-signed
+/// transfer stays broadcastable through its whole scheduled window — the fork's
+/// `create_pczt_from_proposal` offers no expiry control and stamps target+40, which would expire
+/// the transfer hours before its window opens.
+///
+/// Note selection stays with the input selector (the `proposal` argument); only PCZT creation is
+/// replicated here. Proving/signing reuse `backend::prove_sign_finalize` unchanged.
+pub(crate) fn build_transfer_pczt<P: Parameters>(
+    db: &mut Db<P>,
+    network: &P,
+    usk: &UnifiedSpendingKey,
+    proposal: &Proposal<Zip317FeeRule, ReceivedNoteId>,
+    crossing_zatoshi: u64,
+    expiry_height: u32,
+) -> Result<pczt::Pczt, MigrationError> {
+    let step = proposal.steps().first();
+    let inputs = step.shielded_inputs().ok_or_else(|| {
+        MigrationError::Pipeline("transfer: proposal has no shielded inputs".into())
+    })?;
+    let anchor_height = inputs.anchor_height();
+
+    // --- witnesses for the spent V2 notes (orchard tree) ---
+    let (orchard_anchor, spends) = db.with_orchard_tree_mut::<_, _, MigrationError>(|tree| {
+        let anchor: orchard::Anchor = tree
+            .root_at_checkpoint_id(&anchor_height)?
+            .ok_or_else(|| {
+                MigrationError::Pipeline(format!(
+                    "transfer: orchard anchor not found at height {anchor_height}"
+                ))
+            })?
+            .into();
+        let mut spends: Vec<(orchard::note::Note, orchard::tree::MerklePath)> = Vec::new();
+        for selected in inputs.notes() {
+            let Note::Orchard(note) = selected.note() else {
+                return Err(MigrationError::Pipeline(
+                    "transfer: proposal selected a non-Orchard note".into(),
+                ));
+            };
+            if note.version() != orchard::note::NoteVersion::V2 {
+                return Err(MigrationError::Pipeline(
+                    "transfer: proposal selected a non-V2 Orchard note".into(),
+                ));
+            }
+            let merkle_path = tree
+                .witness_at_checkpoint_id_caching(
+                    selected.note_commitment_tree_position(),
+                    &anchor_height,
+                )?
+                .ok_or_else(|| {
+                    MigrationError::Pipeline(format!(
+                        "transfer: witness checkpoint pruned at {anchor_height}"
+                    ))
+                })?;
+            spends.push((*note, merkle_path.into()));
+        }
+        Ok((anchor, spends))
+    })?;
+    if spends.is_empty() {
+        return Err(MigrationError::Pipeline(
+            "transfer: no spendable V2 inputs in proposal".into(),
+        ));
+    }
+
+    // --- ironwood anchor for the output-side bundle (no ironwood spends, root only) ---
+    let ironwood_anchor: orchard::Anchor =
+        db.with_ironwood_tree_mut::<_, _, MigrationError>(|tree| {
+            Ok(tree
+                .root_at_checkpoint_id(&anchor_height)?
+                .ok_or_else(|| {
+                    MigrationError::Pipeline(format!(
+                        "transfer: ironwood anchor not found at height {anchor_height}"
+                    ))
+                })?
+                .into())
+        })?;
+
+    // --- build: V2 spends → one Ironwood crossing output (+ Ironwood change), real expiry ---
+    let mut builder = Builder::new(
+        network.clone(),
+        BlockHeight::from(proposal.min_target_height()),
+        BuildConfig::Standard {
+            sapling_anchor: None,
+            orchard_anchor: Some(orchard_anchor),
+            ironwood_anchor: Some(ironwood_anchor),
+        },
+    )
+    .with_expiry_height(BlockHeight::from_u32(expiry_height));
+    let orchard_fvk = orchard::keys::FullViewingKey::from(usk.orchard());
+    for (note, merkle_path) in spends {
+        builder
+            .add_orchard_spend::<std::convert::Infallible>(orchard_fvk.clone(), note, merkle_path)
+            .map_err(|e| MigrationError::Pipeline(format!("transfer: add spend: {e:?}")))?;
+    }
+    // The crossing output — a self-send to the wallet's default external receiver (mirrors the
+    // proposal's self-payment; any wallet-owned receiver is equivalent for a migration).
+    builder
+        .add_ironwood_output::<std::convert::Infallible>(
+            Some(orchard_fvk.to_ovk(orchard::keys::Scope::External)),
+            orchard_fvk.address_at(0u32, orchard::keys::Scope::External),
+            Zatoshis::const_from_u64(crossing_zatoshi),
+            MemoBytes::empty(),
+        )
+        .map_err(|e| MigrationError::Pipeline(format!("transfer: add output: {e:?}")))?;
+    // Change per the proposal's balance: Orchard-pool change crosses into Ironwood post-NU6.3
+    // (the fork's own routing), at the internal (change) address.
+    let change_address = orchard_fvk.address_at(0u32, orchard::keys::Scope::Internal);
+    let internal_ovk = orchard_fvk.to_ovk(orchard::keys::Scope::Internal);
+    for change in step.balance().proposed_change() {
+        match change.output_pool() {
+            PoolType::Shielded(ShieldedProtocol::Orchard) => {
+                builder
+                    .add_ironwood_change_output::<std::convert::Infallible>(
+                        orchard_fvk.clone(),
+                        Some(internal_ovk.clone()),
+                        change_address,
+                        change.value(),
+                        MemoBytes::empty(),
+                    )
+                    .map_err(|e| {
+                        MigrationError::Pipeline(format!("transfer: add change: {e:?}"))
+                    })?;
+            }
+            other => {
+                return Err(MigrationError::Pipeline(format!(
+                    "transfer: unexpected change pool {other:?}"
+                )));
+            }
+        }
+    }
+
+    let build_result = builder
+        .build_for_pczt(OsRng, &Zip317FeeRule::standard())
+        .map_err(|e| MigrationError::Pipeline(format!("transfer: build: {e:?}")))?;
+    let created = pczt::roles::creator::Creator::build_from_parts(build_result.pczt_parts)
+        .ok_or_else(|| MigrationError::Pipeline("transfer: pczt creation failed".into()))?;
+    pczt::roles::io_finalizer::IoFinalizer::new(created)
+        .finalize_io()
+        .map_err(|e| MigrationError::Pipeline(format!("transfer: io finalize: {e:?}")))
 }
 
 #[cfg(test)]

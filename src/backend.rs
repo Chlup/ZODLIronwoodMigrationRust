@@ -21,13 +21,12 @@ use zcash_client_backend::data_api::wallet::input_selection::{
     GreedyInputSelector, InputSelector, InputSelectorError,
 };
 use zcash_client_backend::data_api::wallet::{
-    create_pczt_from_proposal_with_tx_version, ConfirmationsPolicy, TargetHeight,
+    ConfirmationsPolicy, TargetHeight,
 };
 use zcash_client_backend::data_api::WalletRead;
 use zcash_client_backend::fees::zip317::MultiOutputChangeStrategy;
 use zcash_client_backend::fees::{DustOutputPolicy, SplitPolicy};
 use zcash_client_backend::proposal::Proposal;
-use zcash_client_backend::wallet::OvkPolicy;
 use zcash_client_sqlite::util::SystemClock;
 use zcash_client_sqlite::{AccountUuid, ReceivedNoteId, WalletDb};
 use zcash_keys::keys::{Era, UnifiedAddressRequest, UnifiedSpendingKey};
@@ -265,41 +264,11 @@ pub(crate) fn sweep_crossing_value<P: Parameters>(
     Ok(total.checked_sub(fee).filter(|crossing| *crossing > 0))
 }
 
-/// Drive the full PCZT pipeline for a proposal: create the PCZT at V6, then prove, sign, and
-/// serialize. Migration transfers cross Orchard-destined outputs into Ironwood per the fork's
-/// `orchard_outputs_to_ironwood` rule; the note split does NOT go through here (see
-/// `split::build_split_pczt`).
-pub(crate) fn build_signed_pczt<P: Parameters>(
-    db: &mut Db<P>,
-    network: &P,
-    account: AccountUuid,
-    usk: &UnifiedSpendingKey,
-    proposal: &Proposal<Zip317FeeRule, ReceivedNoteId>,
-) -> Result<SignedPczt, MigrationError> {
-    let pczt = create_pczt_from_proposal_with_tx_version::<
-        _,
-        _,
-        std::convert::Infallible,
-        _,
-        std::convert::Infallible,
-        _,
-    >(
-        db,
-        network,
-        account,
-        OvkPolicy::Sender,
-        proposal,
-        TxVersion::V6,
-    )
-    .map_err(|e| MigrationError::Pipeline(format!("create pczt: {e:?}")))?;
-    prove_sign_finalize(pczt, usk)
-}
-
 /// Prove, sign, finalize, and serialize an assembled PCZT. Shared by the migration transfers
-/// (whose PCZT comes from the fork's `create_pczt_from_proposal_with_tx_version`) and the note
-/// split (whose PCZT comes from `split::build_split_pczt`). The Orchard bundle is
-/// `OrchardPostNu6_3` in both cases, so one proving key serves; the Ironwood proof only runs when
-/// the PCZT carries an Ironwood bundle (migration transfers).
+/// (`split::build_transfer_pczt`) and the note split (`split::build_split_pczt`) — both build
+/// directly on the public transaction builder. The Orchard bundle is `OrchardPostNu6_3` in both
+/// cases, so one proving key serves; the Ironwood proof only runs when the PCZT carries an
+/// Ironwood bundle (migration transfers).
 pub(crate) fn prove_sign_finalize(
     pczt: pczt::Pczt,
     usk: &UnifiedSpendingKey,
@@ -456,7 +425,17 @@ pub(crate) fn sign_schedule<P: Parameters>(
             BlockHeight::from(t.anchor_height),
         )?;
         reserved.extend(proposal_note_refs(&proposal));
-        let signed = build_signed_pczt(db, network, account, usk, &proposal)?;
+        // Build directly (not via the fork's create_pczt): the pre-signed transfer must carry a
+        // consensus expiry covering its whole send window, which only the direct builder can set.
+        let pczt = crate::split::build_transfer_pczt(
+            db,
+            network,
+            usk,
+            &proposal,
+            u64::from(t.amount),
+            u32::from(t.expiry_height),
+        )?;
+        let signed = prove_sign_finalize(pczt, usk)?;
         store::insert_pending_txs(conn, run_id, &[pending_row(t, &signed)])?;
     }
     Ok(())
