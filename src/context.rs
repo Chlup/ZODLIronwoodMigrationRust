@@ -450,11 +450,31 @@ impl<P: Parameters + Clone> MigrationContext<P> {
 
     /// Whether the migration is in an invalid state: spendable Orchard remains but no scheduled
     /// transfer covers it.
+    ///
+    /// Only meaningful once a schedule should exist (from [`Phase::BroadcastScheduled`] onward). In
+    /// the pre-schedule phases — the note split underway or confirmed, the transfer plan not yet
+    /// user-approved — having no queued transfers while the balance still sits in Orchard is the
+    /// expected state, not an invalid one; without this gate a relaunch in those phases was
+    /// misrouted to the "Transfer No Longer Valid" recovery screen.
     pub fn has_invalid_transfers(&self) -> Result<bool, MigrationError> {
         let conn = self.store_conn()?;
         let Some(run) = self.active_run(&conn)? else {
             return Ok(false);
         };
+        let pre_schedule = Phase::parse(&run.phase).is_some_and(|p| {
+            matches!(
+                p,
+                Phase::NoOrchardFunds
+                    | Phase::WaitingForSpendableOrchard
+                    | Phase::ReadyToPrepare
+                    | Phase::PreparingDenominations
+                    | Phase::WaitingDenomConfirmations
+                    | Phase::ReadyToMigrate
+            )
+        });
+        if pre_schedule {
+            return Ok(false);
+        }
         let totals = store::pending_totals(&conn, &run.run_id)?;
         let nothing_queued = totals.scheduled == 0 && totals.broadcasted == 0;
         Ok(nothing_queued && self.orchard_spendable()? > 0)
@@ -531,5 +551,42 @@ mod tests {
             attention_from_error("transfer run-1 expired"),
             AttentionReason::TransferExpired
         );
+    }
+
+    /// Inserts an active run at `phase` for the fixture's account and returns the context.
+    fn ctx_with_run_at(phase: Phase) -> (NamedTempFile, MigrationContext<crate::types::Network>) {
+        let (file, ctx) = ctx();
+        let conn = ctx.store_conn().unwrap();
+        store::insert_run(
+            &conn,
+            &store::NewRun {
+                run_id: "run-phase-test",
+                account_uuid: &ctx.account_str(),
+                network: ctx.network_str(),
+                db_fingerprint: &ctx.db_path,
+                phase,
+                prep_txid: None,
+                target_values: &[],
+            },
+        )
+        .unwrap();
+        (file, ctx)
+    }
+
+    // Regression: a run resumed in a pre-schedule phase (split underway, awaiting confirmation, or
+    // ready to propose) has NO queued transfers and a spendable Orchard balance by design — it must
+    // not classify as "invalid" (which routed relaunches into "Transfer No Longer Valid"). The
+    // fixture's wallet path is not a real wallet DB, so these also prove the pre-schedule gate
+    // returns before any wallet access.
+    #[test]
+    fn has_invalid_transfers_is_false_while_awaiting_denom_confirmations() {
+        let (_file, ctx) = ctx_with_run_at(Phase::WaitingDenomConfirmations);
+        assert_eq!(ctx.has_invalid_transfers().unwrap(), false);
+    }
+
+    #[test]
+    fn has_invalid_transfers_is_false_when_ready_to_migrate() {
+        let (_file, ctx) = ctx_with_run_at(Phase::ReadyToMigrate);
+        assert_eq!(ctx.has_invalid_transfers().unwrap(), false);
     }
 }
