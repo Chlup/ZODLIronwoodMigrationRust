@@ -377,6 +377,19 @@ pub(crate) fn next_scheduled_send_height(
     )
 }
 
+/// Txids of a run's broadcasted-but-not-yet-confirmed transfers.
+pub(crate) fn broadcasted_txids(
+    conn: &Connection,
+    run_id: &str,
+) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT txid_hex FROM ext_ironwood_migration_pending_txs
+         WHERE run_id = ?1 AND status = 'broadcasted'",
+    )?;
+    let rows = stmt.query_map(params![run_id], |row| row.get::<_, String>(0))?;
+    rows.collect()
+}
+
 pub(crate) fn mark_pending_status(
     conn: &Connection,
     txid_hex: &str,
@@ -590,6 +603,24 @@ mod tests {
         sample_run(&conn, "done", Phase::Complete);
         insert_prepared_notes(&conn, "done", &[note("AABB", 0, "locked")]).unwrap();
         assert!(locked_note_refs(&conn, "acct", None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn broadcasted_txids_returns_only_broadcasted_rows_of_the_run() {
+        let conn = db();
+        sample_run(&conn, "r1", Phase::BroadcastScheduled);
+        insert_pending_txs(
+            &conn,
+            "r1",
+            &[
+                pending("t1", 1000, "broadcasted"),
+                pending("t2", 1300, "scheduled"),
+                pending("t3", 1600, "confirmed"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(broadcasted_txids(&conn, "r1").unwrap(), vec!["t1".to_string()]);
+        assert!(broadcasted_txids(&conn, "other").unwrap().is_empty());
     }
 
     // Regression: a run's own locked notes must not be excluded from its own operations — the

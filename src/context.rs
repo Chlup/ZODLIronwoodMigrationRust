@@ -102,6 +102,23 @@ impl<P: Parameters + Clone> MigrationContext<P> {
         let phase = Phase::parse(&run.phase).ok_or_else(|| {
             MigrationError::InvalidState(InvalidStateError::UnknownPhase(run.phase.clone()))
         })?;
+        // Transfer-confirmation reconciliation: the platform only reports the broadcast; mining is
+        // observed via the wallet's scan (mirroring the split's prep-tx detection). Without this,
+        // `confirmed` never advances and the progress UI shows every sent transfer as still active.
+        if matches!(
+            phase,
+            Phase::BroadcastScheduled | Phase::Broadcasting | Phase::WaitingMigrationConfirmations
+        ) {
+            let broadcasted = store::broadcasted_txids(&conn, &run.run_id)?;
+            if !broadcasted.is_empty() {
+                let db = self.open_wallet()?;
+                for txid in broadcasted {
+                    if backend::is_tx_mined(&db, &txid)? {
+                        store::mark_pending_status(&conn, &txid, "confirmed")?;
+                    }
+                }
+            }
+        }
         let progress = self.progress_for_run(&conn, &run.run_id)?;
         let attention = run
             .last_error
