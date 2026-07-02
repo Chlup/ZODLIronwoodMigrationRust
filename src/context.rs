@@ -494,7 +494,7 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
-    fn ctx() -> (NamedTempFile, MigrationContext) {
+    fn ctx() -> (NamedTempFile, MigrationContext<crate::types::Network>) {
         let file = NamedTempFile::new().unwrap();
         let path = file.path().to_str().unwrap().to_string();
         let ctx = MigrationContext::new(&path, crate::types::Network::MainNetwork, [7u8; 16]).unwrap();

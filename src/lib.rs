@@ -46,6 +46,8 @@ mod backend;
 mod context;
 #[cfg(feature = "librustzcash-backend")]
 mod reserved_source;
+#[cfg(feature = "librustzcash-backend")]
+mod split;
 
 #[cfg(feature = "librustzcash-backend")]
 pub use context::MigrationContext;
