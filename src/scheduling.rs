@@ -4,8 +4,10 @@
 //! All transfers in a schedule share one **anchor** — the wallet's natural anchor from
 //! `get_target_and_anchor_heights`. De-correlation between a wallet's own transfers comes from
 //! staggered send heights (`next_executable_after_height`, one bucket apart) and distinct expiry
-//! heights. The first privacy-path transfer is delayed one bucket so it does not correlate with the
-//! moment the user confirmed the schedule. See the design spec §6.
+//! heights. The first transfer is executable immediately (`first_delay_blocks = 0` on both paths):
+//! de-correlation from user activity is the *send-time* machinery's job (background delivery, and —
+//! future rule — no send earlier than ~10 minutes after the last sync), not the schedule's. Sends
+//! do not correlate with the confirm tap because nothing broadcasts in the foreground.
 //!
 //! NOTE: an earlier design floored the anchor to a shared network-wide 288-block bucket
 //! (`floor(natural_anchor / 288) * 288`) to hide the wallet's last sync time. That cannot work
@@ -20,8 +22,6 @@ use zcash_protocol::value::Zatoshis;
 
 /// Blocks between successive transfers' send windows.
 pub(crate) const TRANSFER_CADENCE_BLOCKS: u32 = 288;
-/// Delay (blocks) before the first privacy-path transfer may broadcast.
-pub(crate) const FIRST_TRANSFER_DELAY_BLOCKS: u32 = 288;
 /// Blocks after its send window during which a transfer remains valid.
 pub(crate) const TRANSFER_EXPIRY_WINDOW_BLOCKS: u32 = 288;
 /// Approximate blocks per hour (~75 s/block).
@@ -32,8 +32,9 @@ pub(crate) const BLOCKS_PER_HOUR: u32 = 48;
 /// All transfers share `natural_anchor` — a real, witnessable note-commitment-tree checkpoint (see
 /// the module note on why this is not bucketed). Transfer `i` may broadcast at
 /// `target_height + first_delay_blocks + i * TRANSFER_CADENCE_BLOCKS` and expires
-/// `TRANSFER_EXPIRY_WINDOW_BLOCKS` later. Pass `first_delay_blocks = FIRST_TRANSFER_DELAY_BLOCKS`
-/// for the privacy path, or `0` for an immediate single transfer.
+/// `TRANSFER_EXPIRY_WINDOW_BLOCKS` later. Both paths pass `first_delay_blocks = 0` today (the first
+/// transfer is executable immediately; send-time machinery owns de-correlation) — the parameter
+/// remains for schedule shaping.
 pub(crate) fn build_schedule(
     run_id: &str,
     amounts: &[u64],
@@ -83,7 +84,7 @@ mod tests {
 
     #[test]
     fn schedule_is_empty_for_no_amounts() {
-        let s = build_schedule("run", &[], 1000, 2000, FIRST_TRANSFER_DELAY_BLOCKS);
+        let s = build_schedule("run", &[], 1000, 2000, 288);
         assert!(s.transfers.is_empty());
         assert_eq!(s.estimated_duration_hours, 0);
     }
@@ -95,7 +96,7 @@ mod tests {
             &[10, 20, 30],
             1000,
             2_880_290,
-            FIRST_TRANSFER_DELAY_BLOCKS,
+            288,
         );
         let anchors: Vec<u32> = s
             .transfers
@@ -114,7 +115,7 @@ mod tests {
             &[10, 20, 30],
             1000,
             2000,
-            FIRST_TRANSFER_DELAY_BLOCKS,
+            288,
         );
         let sends: Vec<u32> = s
             .transfers
@@ -137,7 +138,7 @@ mod tests {
             &[10, 20, 30],
             1000,
             2000,
-            FIRST_TRANSFER_DELAY_BLOCKS,
+            0,
         );
         let amounts: Vec<u64> = s.transfers.iter().map(|t| u64::from(t.amount)).collect();
         assert_eq!(amounts, vec![10, 20, 30]);
@@ -150,7 +151,7 @@ mod tests {
             &[10, 20, 30],
             1000,
             2000,
-            FIRST_TRANSFER_DELAY_BLOCKS,
+            0,
         );
         let ids: Vec<String> = s.transfers.iter().map(|t| t.id.clone()).collect();
         let unique: std::collections::HashSet<&String> = ids.iter().collect();
@@ -159,11 +160,13 @@ mod tests {
     }
 
     #[test]
-    fn estimated_duration_matches_app_examples() {
-        let three = build_schedule("r", &[1, 2, 3], 1000, 2000, FIRST_TRANSFER_DELAY_BLOCKS);
-        assert_eq!(three.estimated_duration_hours, 18);
-        let one = build_schedule("r", &[1], 1000, 2000, FIRST_TRANSFER_DELAY_BLOCKS);
-        assert_eq!(one.estimated_duration_hours, 6);
+    fn estimated_duration_spans_to_the_last_window() {
+        // First transfer immediate (delay 0): three transfers span 2 × 288 blocks ≈ 12h; a single
+        // transfer completes immediately.
+        let three = build_schedule("r", &[1, 2, 3], 1000, 2000, 0);
+        assert_eq!(three.estimated_duration_hours, 12);
+        let one = build_schedule("r", &[1], 1000, 2000, 0);
+        assert_eq!(one.estimated_duration_hours, 0);
     }
 
     #[test]

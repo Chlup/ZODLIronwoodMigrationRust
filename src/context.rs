@@ -275,7 +275,9 @@ impl<P: Parameters + Clone> MigrationContext<P> {
             &plan.crossing_values,
             target,
             anchor,
-            scheduling::FIRST_TRANSFER_DELAY_BLOCKS,
+            // First transfer executable immediately; de-correlation from user activity is the
+            // send-time machinery's job (background delivery; future: ≥10 min after last sync).
+            0,
         ))
     }
 
