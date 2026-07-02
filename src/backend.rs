@@ -17,21 +17,22 @@ use std::sync::OnceLock;
 use rand::rngs::OsRng;
 use uuid::Uuid;
 use zcash_address::ZcashAddress;
-use zcash_client_backend::data_api::wallet::input_selection::{GreedyInputSelector, InputSelector};
+use zcash_client_backend::data_api::wallet::input_selection::{
+    GreedyInputSelector, InputSelector, InputSelectorError,
+};
 use zcash_client_backend::data_api::wallet::{
-    create_pczt_from_proposal_with_tx_version, ConfirmationsPolicy, TargetHeight,
+    ConfirmationsPolicy, TargetHeight,
 };
 use zcash_client_backend::data_api::WalletRead;
 use zcash_client_backend::fees::zip317::MultiOutputChangeStrategy;
 use zcash_client_backend::fees::{DustOutputPolicy, SplitPolicy};
 use zcash_client_backend::proposal::Proposal;
-use zcash_client_backend::wallet::OvkPolicy;
 use zcash_client_sqlite::util::SystemClock;
 use zcash_client_sqlite::{AccountUuid, ReceivedNoteId, WalletDb};
 use zcash_keys::keys::{Era, UnifiedAddressRequest, UnifiedSpendingKey};
 use zcash_primitives::transaction::fees::zip317::FeeRule as Zip317FeeRule;
 use zcash_primitives::transaction::{TxId, TxVersion};
-use zcash_protocol::consensus::{self, BlockHeight, Parameters};
+use zcash_protocol::consensus::{BlockHeight, Parameters};
 use zcash_protocol::value::Zatoshis;
 use zcash_protocol::ShieldedProtocol;
 use zip321::{Payment, TransactionRequest};
@@ -39,10 +40,10 @@ use zip321::{Payment, TransactionRequest};
 use crate::error::MigrationError;
 use crate::reserved_source::ReservedInputSource;
 use crate::store;
-use crate::types::Network;
 
-/// The concrete wallet database handle the backend operates on.
-pub(crate) type Db = WalletDb<rusqlite::Connection, consensus::Network, SystemClock, OsRng>;
+/// The wallet database handle the backend operates on, generic over the consensus [`Parameters`] `P`
+/// (so it works for standard Mainnet/Testnet and for a custom network with runtime activation heights).
+pub(crate) type Db<P> = WalletDb<rusqlite::Connection, P, SystemClock, OsRng>;
 
 /// Spendable Orchard balance and total Ironwood balance (zatoshi) for an account.
 pub(crate) struct PoolBalances {
@@ -68,15 +69,18 @@ pub(crate) fn parse_usk(bytes: &[u8]) -> Result<UnifiedSpendingKey, MigrationErr
         .map_err(|e| MigrationError::Pipeline(format!("invalid unified spending key: {e:?}")))
 }
 
-/// Open the wallet database at `db_path`. `Network` is `zcash_protocol::consensus::Network`, the
-/// same type the [`Db`] is parameterised by, so it is passed straight through.
-pub(crate) fn open_wallet(db_path: &str, network: Network) -> Result<Db, MigrationError> {
+/// Open the wallet database at `db_path` with consensus parameters `network` (any [`Parameters`] impl:
+/// standard Mainnet/Testnet or a custom network). Passed straight through to [`WalletDb`].
+pub(crate) fn open_wallet<P: Parameters>(db_path: &str, network: P) -> Result<Db<P>, MigrationError> {
     WalletDb::for_path(db_path, network, SystemClock, OsRng)
         .map_err(|e| MigrationError::Pipeline(format!("open wallet: {e:?}")))
 }
 
 /// Read the spendable Orchard and total Ironwood balances for `account`.
-pub(crate) fn pool_balances(db: &Db, account: AccountUuid) -> Result<PoolBalances, MigrationError> {
+pub(crate) fn pool_balances<P: Parameters>(
+    db: &Db<P>,
+    account: AccountUuid,
+) -> Result<PoolBalances, MigrationError> {
     let summary = db
         .get_wallet_summary(ConfirmationsPolicy::default())?
         .ok_or(MigrationError::NotSynced)?;
@@ -92,8 +96,33 @@ pub(crate) fn pool_balances(db: &Db, account: AccountUuid) -> Result<PoolBalance
     })
 }
 
+/// Parse a display-order (big-endian) txid hex string back into a `TxId` (internal little-endian).
+fn txid_from_display_hex(hex: &str) -> Option<TxId> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    bytes.reverse(); // display order -> internal order
+    Some(TxId::from_bytes(bytes))
+}
+
+/// Whether the wallet has mined the transaction with the given display-order txid. Used to detect
+/// that the denomination-split (prep) transaction has confirmed, so the migration can proceed.
+pub(crate) fn is_tx_mined<P: Parameters>(
+    db: &Db<P>,
+    txid_display_hex: &str,
+) -> Result<bool, MigrationError> {
+    let Some(txid) = txid_from_display_hex(txid_display_hex) else {
+        return Ok(false);
+    };
+    Ok(db.get_tx_height(txid)?.is_some())
+}
+
 /// Read the current target height and the wallet's natural (spendable) anchor height.
-pub(crate) fn target_and_anchor(db: &Db) -> Result<(u32, u32), MigrationError> {
+pub(crate) fn target_and_anchor<P: Parameters>(db: &Db<P>) -> Result<(u32, u32), MigrationError> {
     let (target, anchor) = db
         .get_target_and_anchor_heights(ConfirmationsPolicy::default().trusted())?
         .ok_or(MigrationError::NotSynced)?;
@@ -102,7 +131,8 @@ pub(crate) fn target_and_anchor(db: &Db) -> Result<(u32, u32), MigrationError> {
 
 // ======================== Proving keys ========================
 // Built once per process (in-memory; no 50 MB params). The migration transaction carries an Orchard
-// (V2 spend) bundle and an Ironwood (V3 output) bundle, each proved with its own circuit. The exact
+// (V2 spend) bundle and an Ironwood (V3 output) bundle, each proved with its own circuit; the note
+// split carries only an Orchard bundle and proves it with the same `OrchardPostNu6_3` key. The exact
 // circuit-version pairing must be confirmed at runtime against a synced wallet.
 
 fn orchard_proving_key() -> &'static orchard::circuit::ProvingKey {
@@ -128,9 +158,9 @@ fn ironwood_proving_key() -> &'static orchard::circuit::ProvingKey {
 /// Propose a single migration transfer: spend reserved notes (excluding locked ones) at the
 /// bucket-aligned `anchor` and emit one Ironwood (V6) output described by `request`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn propose_migration_transfer<'a>(
-    db: &'a Db,
-    network: &consensus::Network,
+pub(crate) fn propose_migration_transfer<'a, P: Parameters>(
+    db: &'a Db<P>,
+    network: &P,
     account: AccountUuid,
     request: TransactionRequest,
     reserved: &'a BTreeSet<ReceivedNoteId>,
@@ -144,14 +174,14 @@ pub(crate) fn propose_migration_transfer<'a>(
         migration_locks,
     };
     let change_strategy =
-        MultiOutputChangeStrategy::<Zip317FeeRule, ReservedInputSource<'a, Db>>::new(
+        MultiOutputChangeStrategy::<Zip317FeeRule, ReservedInputSource<'a, Db<P>>>::new(
             Zip317FeeRule::standard(),
             None,
             ShieldedProtocol::Orchard,
             DustOutputPolicy::default(),
             SplitPolicy::single_output(),
         );
-    let input_selector = GreedyInputSelector::<ReservedInputSource<'a, Db>>::new();
+    let input_selector = GreedyInputSelector::<ReservedInputSource<'a, Db<P>>>::new();
     input_selector
         .propose_transaction(
             network,
@@ -167,35 +197,82 @@ pub(crate) fn propose_migration_transfer<'a>(
         .map_err(|e| MigrationError::Pipeline(format!("propose migration transfer: {e}")))
 }
 
-/// Drive the full PCZT pipeline for a proposal: create the PCZT at V6, prove the Orchard and
-/// Ironwood bundles, software-sign every Orchard spend with the USK's spend-authorizing key, and
-/// serialize. Returns the serialized signed PCZT plus the extracted transaction id.
-pub(crate) fn build_signed_pczt(
-    db: &mut Db,
-    network: &consensus::Network,
+/// The exact "migrate everything" crossing value for the immediate (single-transaction) path: the
+/// whole spendable Orchard balance minus the fee to spend all of it into one Ironwood output.
+///
+/// Unlike the private path there is no note split to self-fund the fee, so the single sweep transfer
+/// must account for the fee up front. We let the input selector compute it rather than estimating:
+/// a request for the *entire* balance forces every note to be selected and fails with
+/// `InsufficientFunds { required = total + fee }`, so `fee = required - available` and the crossing
+/// value is `total - fee`. Returns `None` when nothing is migratable (balance at or below the fee).
+pub(crate) fn sweep_crossing_value<P: Parameters>(
+    db: &Db<P>,
+    network: &P,
     account: AccountUuid,
-    usk: &UnifiedSpendingKey,
-    proposal: &Proposal<Zip317FeeRule, ReceivedNoteId>,
-) -> Result<SignedPczt, MigrationError> {
-    // 1. Create the PCZT (V6 forces the Ironwood output).
-    let pczt = create_pczt_from_proposal_with_tx_version::<
-        _,
-        _,
-        std::convert::Infallible,
-        _,
-        std::convert::Infallible,
-        _,
-    >(
-        db,
-        network,
-        account,
-        OvkPolicy::Sender,
-        proposal,
-        TxVersion::V6,
-    )
-    .map_err(|e| MigrationError::Pipeline(format!("create pczt: {e:?}")))?;
+) -> Result<Option<u64>, MigrationError> {
+    let total = pool_balances(db, account)?.orchard_spendable;
+    if total == 0 {
+        return Ok(None);
+    }
+    let (target, anchor) = db
+        .get_target_and_anchor_heights(ConfirmationsPolicy::default().trusted())?
+        .ok_or(MigrationError::NotSynced)?;
 
-    // 2. Prove each bundle that requires it.
+    let request = self_payment_request(db, network, account, total)?;
+    let reserved: BTreeSet<ReceivedNoteId> = BTreeSet::new();
+    let locks: BTreeSet<(String, u32)> = BTreeSet::new();
+    let reserved_db = ReservedInputSource {
+        inner: db,
+        reserved: &reserved,
+        migration_locks: &locks,
+    };
+    let change_strategy =
+        MultiOutputChangeStrategy::<Zip317FeeRule, ReservedInputSource<'_, Db<P>>>::new(
+            Zip317FeeRule::standard(),
+            None,
+            ShieldedProtocol::Orchard,
+            DustOutputPolicy::default(),
+            SplitPolicy::single_output(),
+        );
+    let input_selector = GreedyInputSelector::<ReservedInputSource<'_, Db<P>>>::new();
+
+    let fee = match input_selector.propose_transaction(
+        network,
+        &reserved_db,
+        target,
+        anchor,
+        ConfirmationsPolicy::default(),
+        account,
+        request,
+        &change_strategy,
+        Some(TxVersion::V6),
+    ) {
+        // The whole balance is already proposable (fee somehow covered) — read the actual fee.
+        Ok(proposal) => u64::from(proposal.steps().last().balance().fee_required()),
+        // Expected: requesting the whole balance falls exactly `fee` short of covering itself.
+        Err(InputSelectorError::InsufficientFunds {
+            available,
+            required,
+        }) => u64::from(required).saturating_sub(u64::from(available)),
+        Err(e) => {
+            return Err(MigrationError::Pipeline(format!(
+                "immediate sweep probe: {e}"
+            )))
+        }
+    };
+
+    Ok(total.checked_sub(fee).filter(|crossing| *crossing > 0))
+}
+
+/// Prove, sign, finalize, and serialize an assembled PCZT. Shared by the migration transfers
+/// (`split::build_transfer_pczt`) and the note split (`split::build_split_pczt`) — both build
+/// directly on the public transaction builder. The Orchard bundle is `OrchardPostNu6_3` in both
+/// cases, so one proving key serves; the Ironwood proof only runs when the PCZT carries an
+/// Ironwood bundle (migration transfers).
+pub(crate) fn prove_sign_finalize(
+    pczt: pczt::Pczt,
+    usk: &UnifiedSpendingKey,
+) -> Result<SignedPczt, MigrationError> {
     let mut prover = pczt::roles::prover::Prover::new(pczt);
     if prover.requires_orchard_proof() {
         prover = prover
@@ -209,8 +286,9 @@ pub(crate) fn build_signed_pczt(
     }
     let pczt = prover.finish();
 
-    // 3. Sign every Orchard spend that is ours. Action positions are randomized (qleak), so we try
-    // every index and ignore wrong-key actions, terminating on InvalidIndex (the fork's own pattern).
+    // Sign every Orchard spend that is ours — including the note split's fabricated zero-value
+    // change-spends, which are wallet-controlled. Action positions are randomized (qleak), so we
+    // try every index and ignore wrong-key actions, terminating on InvalidIndex.
     let mut signer = pczt::roles::signer::Signer::new(pczt)
         .map_err(|e| MigrationError::Pipeline(format!("pczt signer init: {e:?}")))?;
     let ask = orchard::keys::SpendAuthorizingKey::from(usk.orchard());
@@ -226,7 +304,6 @@ pub(crate) fn build_signed_pczt(
     }
     let pczt = signer.finish();
 
-    // 4. Finalize spends and serialize; extract once to obtain the txid.
     let pczt = pczt::roles::spend_finalizer::SpendFinalizer::new(pczt)
         .finalize_spends()
         .map_err(|e| MigrationError::Pipeline(format!("finalize spends: {e:?}")))?;
@@ -270,9 +347,9 @@ fn build_self_payment(
 
 /// Build a zip321 request paying `amount` to the account's own current unified address (Ironwood
 /// addresses equal the existing Orchard/unified address, so the migration is a self-send).
-fn self_payment_request(
-    db: &Db,
-    network: &consensus::Network,
+fn self_payment_request<P: Parameters>(
+    db: &Db<P>,
+    network: &P,
     account: AccountUuid,
     amount: u64,
 ) -> Result<TransactionRequest, MigrationError> {
@@ -319,10 +396,10 @@ fn pending_row(t: &crate::types::TransferProposal, signed: &SignedPczt) -> store
 /// Build a signed-PCZT for every scheduled transfer at its bucketed anchor and persist it as a
 /// pending tx.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn sign_schedule(
-    db: &mut Db,
+pub(crate) fn sign_schedule<P: Parameters>(
+    db: &mut Db<P>,
     conn: &rusqlite::Connection,
-    network: &consensus::Network,
+    network: &P,
     account: AccountUuid,
     usk: &UnifiedSpendingKey,
     run_id: &str,
@@ -332,7 +409,8 @@ pub(crate) fn sign_schedule(
     let (target, _natural_anchor) = db
         .get_target_and_anchor_heights(ConfirmationsPolicy::default().trusted())?
         .ok_or(MigrationError::NotSynced)?;
-    let locks = store::locked_note_refs(conn, account_str)?;
+    // Exclude the run's OWN prepared notes from the lock set — the transfers exist to spend them.
+    let locks = store::locked_note_refs(conn, account_str, Some(run_id))?;
     let mut reserved: BTreeSet<ReceivedNoteId> = BTreeSet::new();
     for t in transfers {
         let request = self_payment_request(db, network, account, u64::from(t.amount))?;
@@ -347,43 +425,44 @@ pub(crate) fn sign_schedule(
             BlockHeight::from(t.anchor_height),
         )?;
         reserved.extend(proposal_note_refs(&proposal));
-        let signed = build_signed_pczt(db, network, account, usk, &proposal)?;
+        // Build directly (not via the fork's create_pczt): the pre-signed transfer must carry a
+        // consensus expiry covering its whole send window, which only the direct builder can set.
+        let pczt = crate::split::build_transfer_pczt(
+            db,
+            network,
+            usk,
+            &proposal,
+            u64::from(t.amount),
+            u32::from(t.expiry_height),
+        )?;
+        let signed = prove_sign_finalize(pczt, usk)?;
         store::insert_pending_txs(conn, run_id, &[pending_row(t, &signed)])?;
     }
     Ok(())
 }
 
-/// Build, sign (as a PCZT), and persist the note-split (denomination prep) transaction: one
-/// self-send creating the planned output denominations.
+/// Build, sign (as a PCZT), and persist the note-split (denomination prep) transaction: spend the
+/// wallet's V2 notes and fan the value into one **same-address change output** per planned
+/// denomination. Change outputs are the one operation the post-NU6.3 cross-address restriction
+/// sanctions for retaining V2 value, so the split stays in the Orchard pool on the current
+/// (`OrchardPostNu6_3`) circuit. Stored notes carry the residual-adjusted values at their real
+/// (shuffled) action indices, so the `(txid, output_index)` refs match what the scanner stores.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn sign_split(
-    db: &mut Db,
+pub(crate) fn sign_split<P: Parameters>(
+    db: &mut Db<P>,
     conn: &rusqlite::Connection,
-    network: &consensus::Network,
+    network: &P,
     account: AccountUuid,
     usk: &UnifiedSpendingKey,
     run_id: &str,
     account_str: &str,
     outputs: &[u64],
 ) -> Result<SignedPczt, MigrationError> {
-    let (target, natural_anchor) = db
-        .get_target_and_anchor_heights(ConfirmationsPolicy::default().trusted())?
-        .ok_or(MigrationError::NotSynced)?;
-    let locks = store::locked_note_refs(conn, account_str)?;
-    let reserved: BTreeSet<ReceivedNoteId> = BTreeSet::new();
-    let total: u64 = outputs.iter().sum();
-    let request = self_payment_request(db, network, account, total)?;
-    let proposal = propose_migration_transfer(
-        db,
-        network,
-        account,
-        request,
-        &reserved,
-        &locks,
-        target,
-        natural_anchor,
-    )?;
-    let signed = build_signed_pczt(db, network, account, usk, &proposal)?;
+    // Exclude this run's own (not-yet-existing) notes for symmetry; other live runs' stay locked.
+    let locks = store::locked_note_refs(conn, account_str, Some(run_id))?;
+    let (pczt, placed_outputs) =
+        crate::split::build_split_pczt(db, network, account, usk, &locks, outputs)?;
+    let signed = prove_sign_finalize(pczt, usk)?;
     store::insert_prep_tx(
         conn,
         run_id,
@@ -391,12 +470,11 @@ pub(crate) fn sign_split(
         &signed.raw_pczt,
         "pending",
     )?;
-    let prepared: Vec<store::PreparedNote> = outputs
+    let prepared: Vec<store::PreparedNote> = placed_outputs
         .iter()
-        .enumerate()
-        .map(|(i, &value_zatoshi)| store::PreparedNote {
+        .map(|&(action_index, value_zatoshi)| store::PreparedNote {
             txid_hex: signed.txid.to_string(),
-            output_index: i as u32,
+            output_index: action_index,
             value_zatoshi,
             note_version: 2,
             nullifier_hex: None,

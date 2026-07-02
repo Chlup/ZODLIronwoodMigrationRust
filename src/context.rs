@@ -8,7 +8,7 @@
 
 use rusqlite::Connection;
 use uuid::Uuid;
-use zcash_protocol::consensus::BlockHeight;
+use zcash_protocol::consensus::{BlockHeight, NetworkType, Parameters};
 use zcash_protocol::value::Zatoshis;
 
 use crate::backend::{self, Db};
@@ -18,8 +18,8 @@ use crate::scheduling;
 use crate::state::{self, Phase};
 use crate::store;
 use crate::types::{
-    AttentionReason, MigrationProgress, MigrationSchedule, MigrationState, Network,
-    NoteSplitProposal, PreparedTx, TransferResult,
+    AttentionReason, MigrationProgress, MigrationSchedule, MigrationState, NoteSplitProposal,
+    PreparedTx, TransferResult,
 };
 
 /// ZIP-317 single-action fee estimate (zatoshi) used by note-split / migration planning.
@@ -27,18 +27,18 @@ const FEE_ESTIMATE_ZATOSHI: u64 = 10_000;
 
 /// Holds wallet context for migration operations (mirrors how `libzcashlc` passes a db path +
 /// network + account uuid). Open and operate per call; no shared mutable state.
-pub struct MigrationContext {
+pub struct MigrationContext<P> {
     db_path: String,
-    network: Network,
+    network: P,
     account_uuid: [u8; 16],
 }
 
-impl MigrationContext {
+impl<P: Parameters + Clone> MigrationContext<P> {
     /// Create a context bound to a wallet database, network, and account, ensuring the engine's
     /// SQLite tables exist.
     pub fn new(
         db_path: &str,
-        network: Network,
+        network: P,
         account_uuid: [u8; 16],
     ) -> Result<Self, MigrationError> {
         let ctx = Self {
@@ -59,8 +59,8 @@ impl MigrationContext {
         Ok(conn)
     }
 
-    fn open_wallet(&self) -> Result<Db, MigrationError> {
-        backend::open_wallet(&self.db_path, self.network)
+    fn open_wallet(&self) -> Result<Db<P>, MigrationError> {
+        backend::open_wallet(&self.db_path, self.network.clone())
     }
 
     fn account_str(&self) -> String {
@@ -68,9 +68,10 @@ impl MigrationContext {
     }
 
     fn network_str(&self) -> &'static str {
-        match self.network {
-            Network::MainNetwork => "main",
-            Network::TestNetwork => "test",
+        match self.network.network_type() {
+            NetworkType::Main => "main",
+            NetworkType::Test => "test",
+            NetworkType::Regtest => "regtest",
         }
     }
 
@@ -101,6 +102,23 @@ impl MigrationContext {
         let phase = Phase::parse(&run.phase).ok_or_else(|| {
             MigrationError::InvalidState(InvalidStateError::UnknownPhase(run.phase.clone()))
         })?;
+        // Transfer-confirmation reconciliation: the platform only reports the broadcast; mining is
+        // observed via the wallet's scan (mirroring the split's prep-tx detection). Without this,
+        // `confirmed` never advances and the progress UI shows every sent transfer as still active.
+        if matches!(
+            phase,
+            Phase::BroadcastScheduled | Phase::Broadcasting | Phase::WaitingMigrationConfirmations
+        ) {
+            let broadcasted = store::broadcasted_txids(&conn, &run.run_id)?;
+            if !broadcasted.is_empty() {
+                let db = self.open_wallet()?;
+                for txid in broadcasted {
+                    if backend::is_tx_mined(&db, &txid)? {
+                        store::mark_pending_status(&conn, &txid, "confirmed")?;
+                    }
+                }
+            }
+        }
         let progress = self.progress_for_run(&conn, &run.run_id)?;
         let attention = run
             .last_error
@@ -108,6 +126,32 @@ impl MigrationContext {
             .map(attention_from_error)
             .filter(|_| matches!(phase, Phase::FailedRecoverable | Phase::FailedTerminal));
         let mapped = state::to_state(phase, progress, attention);
+        // Denomination-split confirmation: the split has no explicit confirmation callback, so
+        // advance to ReadyToPropose once its (prep) transaction is mined — the resulting notes are
+        // then spendable by the subsequent propose. Covers `PreparingDenominations` (so a broadcast
+        // whose result wasn't recorded still advances) and `WaitingDenomConfirmations`. A prep tx
+        // that isn't mined yet (signed-only or still in the mempool) is `is_tx_mined == false`, so a
+        // not-yet-broadcast split never advances prematurely. Mirrors the `Complete` override below.
+        if matches!(
+            phase,
+            Phase::PreparingDenominations | Phase::WaitingDenomConfirmations
+        ) {
+            if let Some(prep) = store::prep_tx(&conn, &run.run_id)? {
+                let db = self.open_wallet()?;
+                // Mined alone is not enough: the split's change notes must also be SPENDABLE
+                // (enough confirmations for the balance policy). Advancing on mined-only let the
+                // subsequent propose run against a still-zero balance and produce an empty schedule.
+                if backend::is_tx_mined(&db, &prep.txid_hex)? {
+                    let spendable =
+                        backend::pool_balances(&db, backend::account_uuid(self.account_uuid))?
+                            .orchard_spendable;
+                    if spendable > 0 {
+                        store::set_phase(&conn, &run.run_id, Phase::ReadyToMigrate, None)?;
+                        return Ok(MigrationState::ReadyToPropose);
+                    }
+                }
+            }
+        }
         // Completion: an in-progress run whose transfers are all confirmed, with the Orchard
         // balance fully migrated into Ironwood.
         if let MigrationState::InProgress(p) = &mapped {
@@ -173,14 +217,27 @@ impl MigrationContext {
     }
 
     /// Compute the optimal note split for the spendable Orchard balance. Each output note is
-    /// self-funding (`power_of_ten + buffer`); any residual stays in Orchard.
+    /// self-funding (`power_of_ten + buffer`); any residual stays in Orchard. The reported fee is
+    /// the exact ZIP-317 fee for the split transaction (`5000 × (spends + outputs)`, floored at 2
+    /// actions); at signing time the last output absorbs any drift between this plan and the
+    /// then-current balance.
     pub fn prepare_note_split(&self) -> Result<NoteSplitProposal, MigrationError> {
-        let total = self.orchard_spendable()?;
+        let db = self.open_wallet()?;
+        let account = backend::account_uuid(self.account_uuid);
+        let total = backend::pool_balances(&db, account)?
+            .orchard_spendable;
         let plan =
             plan_denominations(total, FEE_ESTIMATE_ZATOSHI).map_err(MigrationError::Pipeline)?;
+        // Pre-split there are no migration locks yet, so no exclusions apply.
+        let locks = std::collections::BTreeSet::new();
+        let n_spends =
+            crate::split::select_spendable_v2_notes(&db, account, &locks)?
+                .len()
+                .max(1);
+        let n_outputs = plan.migration_outputs.len();
         Ok(NoteSplitProposal {
             output_notes: plan.migration_outputs,
-            fee: plan.prep_fee_zatoshi,
+            fee: crate::split::split_fee(n_spends, n_outputs),
         })
     }
 
@@ -243,7 +300,29 @@ impl MigrationContext {
             &plan.crossing_values,
             target,
             anchor,
-            scheduling::FIRST_TRANSFER_DELAY_BLOCKS,
+            // First transfer executable immediately; de-correlation from user activity is the
+            // send-time machinery's job (background delivery; future: ≥10 min after last sync).
+            0,
+        ))
+    }
+
+    /// Propose the immediate (single-transaction) migration: sweep the entire spendable Orchard
+    /// balance into one Ironwood output, executable now. Unlike the private path there is no
+    /// denomination and no note split — the whole balance (minus the transaction fee) crosses in a
+    /// single transfer. Returns an empty schedule when nothing is migratable.
+    pub fn propose_immediate_migration_transfers(&self) -> Result<MigrationSchedule, MigrationError> {
+        let db = self.open_wallet()?;
+        let account = backend::account_uuid(self.account_uuid);
+        let (target, anchor) = backend::target_and_anchor(&db)?;
+        let crossing = backend::sweep_crossing_value(&db, &self.network, account)?;
+        let run_id = new_run_id();
+        let amounts = crossing.map(|value| vec![value]).unwrap_or_default();
+        Ok(scheduling::build_schedule(
+            &run_id,
+            &amounts,
+            target,
+            anchor,
+            0, // immediate: executable now, no first-transfer privacy delay
         ))
     }
 
@@ -253,6 +332,13 @@ impl MigrationContext {
         schedule: &MigrationSchedule,
         usk: &[u8],
     ) -> Result<(), MigrationError> {
+        // Refuse an empty schedule outright: signing it would advance the run into the
+        // post-schedule phases with nothing queued, which reads as an invalid migration.
+        if schedule.transfers.is_empty() {
+            return Err(MigrationError::InvalidState(
+                InvalidStateError::NotApplicable("cannot sign an empty schedule"),
+            ));
+        }
         let parsed = backend::parse_usk(usk)?;
         let conn = self.store_conn()?;
         let run_id = match self.active_run(&conn)? {
@@ -398,11 +484,31 @@ impl MigrationContext {
 
     /// Whether the migration is in an invalid state: spendable Orchard remains but no scheduled
     /// transfer covers it.
+    ///
+    /// Only meaningful once a schedule should exist (from [`Phase::BroadcastScheduled`] onward). In
+    /// the pre-schedule phases — the note split underway or confirmed, the transfer plan not yet
+    /// user-approved — having no queued transfers while the balance still sits in Orchard is the
+    /// expected state, not an invalid one; without this gate a relaunch in those phases was
+    /// misrouted to the "Transfer No Longer Valid" recovery screen.
     pub fn has_invalid_transfers(&self) -> Result<bool, MigrationError> {
         let conn = self.store_conn()?;
         let Some(run) = self.active_run(&conn)? else {
             return Ok(false);
         };
+        let pre_schedule = Phase::parse(&run.phase).is_some_and(|p| {
+            matches!(
+                p,
+                Phase::NoOrchardFunds
+                    | Phase::WaitingForSpendableOrchard
+                    | Phase::ReadyToPrepare
+                    | Phase::PreparingDenominations
+                    | Phase::WaitingDenomConfirmations
+                    | Phase::ReadyToMigrate
+            )
+        });
+        if pre_schedule {
+            return Ok(false);
+        }
         let totals = store::pending_totals(&conn, &run.run_id)?;
         let nothing_queued = totals.scheduled == 0 && totals.broadcasted == 0;
         Ok(nothing_queued && self.orchard_spendable()? > 0)
@@ -455,10 +561,10 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
-    fn ctx() -> (NamedTempFile, MigrationContext) {
+    fn ctx() -> (NamedTempFile, MigrationContext<crate::types::Network>) {
         let file = NamedTempFile::new().unwrap();
         let path = file.path().to_str().unwrap().to_string();
-        let ctx = MigrationContext::new(&path, Network::MainNetwork, [7u8; 16]).unwrap();
+        let ctx = MigrationContext::new(&path, crate::types::Network::MainNetwork, [7u8; 16]).unwrap();
         (file, ctx)
     }
 
@@ -479,5 +585,42 @@ mod tests {
             attention_from_error("transfer run-1 expired"),
             AttentionReason::TransferExpired
         );
+    }
+
+    /// Inserts an active run at `phase` for the fixture's account and returns the context.
+    fn ctx_with_run_at(phase: Phase) -> (NamedTempFile, MigrationContext<crate::types::Network>) {
+        let (file, ctx) = ctx();
+        let conn = ctx.store_conn().unwrap();
+        store::insert_run(
+            &conn,
+            &store::NewRun {
+                run_id: "run-phase-test",
+                account_uuid: &ctx.account_str(),
+                network: ctx.network_str(),
+                db_fingerprint: &ctx.db_path,
+                phase,
+                prep_txid: None,
+                target_values: &[],
+            },
+        )
+        .unwrap();
+        (file, ctx)
+    }
+
+    // Regression: a run resumed in a pre-schedule phase (split underway, awaiting confirmation, or
+    // ready to propose) has NO queued transfers and a spendable Orchard balance by design — it must
+    // not classify as "invalid" (which routed relaunches into "Transfer No Longer Valid"). The
+    // fixture's wallet path is not a real wallet DB, so these also prove the pre-schedule gate
+    // returns before any wallet access.
+    #[test]
+    fn has_invalid_transfers_is_false_while_awaiting_denom_confirmations() {
+        let (_file, ctx) = ctx_with_run_at(Phase::WaitingDenomConfirmations);
+        assert_eq!(ctx.has_invalid_transfers().unwrap(), false);
+    }
+
+    #[test]
+    fn has_invalid_transfers_is_false_when_ready_to_migrate() {
+        let (_file, ctx) = ctx_with_run_at(Phase::ReadyToMigrate);
+        assert_eq!(ctx.has_invalid_transfers().unwrap(), false);
     }
 }

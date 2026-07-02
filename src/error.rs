@@ -124,6 +124,15 @@ impl From<SqliteClientError> for MigrationError {
     }
 }
 
+/// Commitment-tree access during the direct-builder note split. Gated with the backend feature
+/// because `shardtree` is only pulled in there.
+#[cfg(feature = "librustzcash-backend")]
+impl<E: core::fmt::Debug> From<shardtree::error::ShardTreeError<E>> for MigrationError {
+    fn from(e: shardtree::error::ShardTreeError<E>) -> Self {
+        MigrationError::Pipeline(format!("commitment tree: {e:?}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

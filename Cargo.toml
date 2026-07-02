@@ -22,6 +22,7 @@ librustzcash-backend = [
     "dep:zip321",
     "dep:orchard",
     "dep:pczt",
+    "dep:shardtree",
     "dep:rand",
     "dep:uuid",
 ]
@@ -58,6 +59,7 @@ zcash_proofs = { version = "0.28", git = "https://github.com/valargroup/librustz
 # zcash_client_backend's `pczt` feature enables, plus `orchard`.
 pczt = { version = "0.7", git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts", default-features = false, features = ["orchard", "io-finalizer", "prover", "signer", "spend-finalizer", "tx-extractor", "zcp-builder"], optional = true }
 orchard = { version = "0.14", git = "https://github.com/zcash/orchard", branch = "adam/qleak-dummy-ciphertexts-on-pr505", default-features = false, features = ["circuit"], optional = true }
+shardtree = { version = "0.6.2", optional = true }
 rand = { version = "0.8", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
 
