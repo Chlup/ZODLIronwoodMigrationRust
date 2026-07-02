@@ -8,12 +8,69 @@
 // outputs (payments AND change) to Ironwood, so this module drives the public
 // `zcash_primitives::transaction::builder::Builder` directly instead.
 
+use std::collections::BTreeSet;
+
+use rand::rngs::OsRng;
+use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
+use zcash_client_backend::data_api::{InputSource, TargetValue, WalletCommitmentTrees, WalletRead};
+use zcash_client_backend::wallet::ReceivedNote;
+use zcash_client_sqlite::{AccountUuid, ReceivedNoteId};
+use zcash_keys::keys::UnifiedSpendingKey;
+use zcash_primitives::transaction::builder::{BuildConfig, Builder};
+use zcash_primitives::transaction::fees::zip317::FeeRule as Zip317FeeRule;
+use zcash_protocol::consensus::{BlockHeight, Parameters};
+use zcash_protocol::memo::MemoBytes;
+use zcash_protocol::value::Zatoshis;
+use zcash_protocol::ShieldedProtocol;
+
+use crate::backend::Db;
 use crate::error::MigrationError;
+use crate::reserved_source::ReservedInputSource;
 
 /// ZIP-317 marginal fee per logical action (zatoshi).
 const MARGINAL_FEE_ZATOSHI: u64 = 5_000;
 /// ZIP-317 grace floor on the action count.
 const GRACE_ACTIONS: u64 = 2;
+
+/// All spendable Orchard **V2** notes for `account`, excluding migration-locked notes. Selection
+/// goes through [`ReservedInputSource`] so its (txid, output_index) lock filtering applies; V3
+/// (Ironwood) notes are filtered out defensively — at split time none should exist yet.
+pub(crate) fn select_spendable_v2_notes<P: Parameters>(
+    db: &Db<P>,
+    account: AccountUuid,
+    migration_locks: &BTreeSet<(String, u32)>,
+) -> Result<Vec<ReceivedNote<ReceivedNoteId, orchard::note::Note>>, MigrationError> {
+    let (target, _anchor) = db
+        .get_target_and_anchor_heights(ConfirmationsPolicy::default().trusted())?
+        .ok_or(MigrationError::NotSynced)?;
+    let total = crate::backend::pool_balances(db, account)?.orchard_spendable;
+    if total == 0 {
+        return Err(MigrationError::Pipeline(
+            "note split: no spendable Orchard balance".into(),
+        ));
+    }
+    let reserved: BTreeSet<ReceivedNoteId> = BTreeSet::new();
+    let source = ReservedInputSource {
+        inner: db,
+        reserved: &reserved,
+        migration_locks,
+    };
+    let notes = source
+        .select_spendable_notes(
+            account,
+            TargetValue::AtLeast(Zatoshis::const_from_u64(total)),
+            &[ShieldedProtocol::Orchard],
+            target,
+            ConfirmationsPolicy::default(),
+            &[],
+        )
+        .map_err(|e| MigrationError::Pipeline(format!("note split: select notes: {e:?}")))?
+        .take_orchard();
+    Ok(notes
+        .into_iter()
+        .filter(|n| n.note().version() == orchard::note::NoteVersion::V2)
+        .collect())
+}
 
 /// Exact ZIP-317 fee for the split transaction. The bundle disables cross-address transfers, so
 /// each spend and each change output occupies its own action: `actions = n_spends + n_changes`
@@ -53,6 +110,111 @@ pub(crate) fn adjust_outputs_for_exact_balance(
     }
     *last = new_last as u64;
     Ok(adjusted)
+}
+
+/// Build the note-split transaction as an unproven PCZT: spend every spendable V2 note and fan the
+/// value into one same-address change output per planned denomination. Runs entirely on public
+/// fork APIs (the fork's `create_pczt_from_proposal` cannot keep V6 Orchard outputs in the V2
+/// pool). Returns the PCZT and the residual-adjusted output values actually used.
+///
+/// The bundle is `OrchardPostNu6_3` (current circuit): `Builder::new` derives the protocol from
+/// the target height's consensus branch, and `build_for_pczt` selects `V6` because that builder is
+/// in use. Change outputs are sanctioned under the cross-address restriction — the orchard builder
+/// pairs each with a fabricated zero-value spend at the change's own address, signed by the normal
+/// signing flow with the wallet's spend-authorizing key.
+// Wired into sign_split by the follow-up commit; the allow keeps this commit warning-clean.
+#[allow(dead_code)]
+pub(crate) fn build_split_pczt<P: Parameters>(
+    db: &mut Db<P>,
+    network: &P,
+    account: AccountUuid,
+    usk: &UnifiedSpendingKey,
+    migration_locks: &BTreeSet<(String, u32)>,
+    outputs: &[u64],
+) -> Result<(pczt::Pczt, Vec<u64>), MigrationError> {
+    // --- immutable phase: select the notes to consolidate ---
+    let notes = select_spendable_v2_notes(db, account, migration_locks)?;
+    if notes.is_empty() {
+        return Err(MigrationError::Pipeline(
+            "note split: no spendable Orchard V2 notes".into(),
+        ));
+    }
+    let selected_total: u64 = notes.iter().map(|n| n.note().value().inner()).sum();
+    let fee = split_fee(notes.len(), outputs.len());
+    let adjusted = adjust_outputs_for_exact_balance(selected_total, fee, outputs)?;
+
+    let (target, natural_anchor) = crate::backend::target_and_anchor(db)?;
+    let anchor_height = BlockHeight::from_u32(natural_anchor);
+
+    // --- mutable phase: anchor root + witness per spent note ---
+    let (anchor, spends) = db.with_orchard_tree_mut::<_, _, MigrationError>(|tree| {
+        let anchor: orchard::Anchor = tree
+            .root_at_checkpoint_id(&anchor_height)?
+            .ok_or_else(|| {
+                MigrationError::Pipeline(format!(
+                    "note split: anchor not found at height {anchor_height}"
+                ))
+            })?
+            .into();
+        let mut spends: Vec<(orchard::note::Note, orchard::tree::MerklePath)> = Vec::new();
+        for received in &notes {
+            let merkle_path = tree
+                .witness_at_checkpoint_id_caching(
+                    received.note_commitment_tree_position(),
+                    &anchor_height,
+                )?
+                .ok_or_else(|| {
+                    MigrationError::Pipeline(format!(
+                        "note split: witness checkpoint pruned at {anchor_height}"
+                    ))
+                })?;
+            spends.push((*received.note(), merkle_path.into()));
+        }
+        Ok((anchor, spends))
+    })?;
+
+    // --- build: n spends + k same-address change outputs, exact balance ---
+    let mut builder = Builder::new(
+        network.clone(),
+        BlockHeight::from_u32(target),
+        BuildConfig::Standard {
+            sapling_anchor: None,
+            orchard_anchor: Some(anchor),
+            ironwood_anchor: None,
+        },
+    );
+    let orchard_fvk = orchard::keys::FullViewingKey::from(usk.orchard());
+    for (note, merkle_path) in spends {
+        builder
+            .add_orchard_spend::<std::convert::Infallible>(orchard_fvk.clone(), note, merkle_path)
+            .map_err(|e| MigrationError::Pipeline(format!("note split: add spend: {e:?}")))?;
+    }
+    let change_address = orchard_fvk.address_at(0u32, orchard::keys::Scope::Internal);
+    let internal_ovk = orchard_fvk.to_ovk(orchard::keys::Scope::Internal);
+    for value in &adjusted {
+        builder
+            .add_orchard_change_output::<std::convert::Infallible>(
+                orchard_fvk.clone(),
+                Some(internal_ovk.clone()),
+                change_address,
+                Zatoshis::const_from_u64(*value),
+                MemoBytes::empty(),
+            )
+            .map_err(|e| MigrationError::Pipeline(format!("note split: add change: {e:?}")))?;
+    }
+
+    let build_result = builder
+        .build_for_pczt(OsRng, &Zip317FeeRule::standard())
+        .map_err(|e| MigrationError::Pipeline(format!("note split: build: {e:?}")))?;
+
+    // --- assemble the PCZT (Creator → IoFinalizer), mirroring the fork's create_pczt tail ---
+    let created = pczt::roles::creator::Creator::build_from_parts(build_result.pczt_parts)
+        .ok_or_else(|| MigrationError::Pipeline("note split: pczt creation failed".into()))?;
+    let finalized = pczt::roles::io_finalizer::IoFinalizer::new(created)
+        .finalize_io()
+        .map_err(|e| MigrationError::Pipeline(format!("note split: io finalize: {e:?}")))?;
+
+    Ok((finalized, adjusted))
 }
 
 #[cfg(test)]
