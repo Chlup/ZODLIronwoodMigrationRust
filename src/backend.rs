@@ -440,7 +440,8 @@ pub(crate) fn sign_schedule<P: Parameters>(
     let (target, _natural_anchor) = db
         .get_target_and_anchor_heights(ConfirmationsPolicy::default().trusted())?
         .ok_or(MigrationError::NotSynced)?;
-    let locks = store::locked_note_refs(conn, account_str)?;
+    // Exclude the run's OWN prepared notes from the lock set — the transfers exist to spend them.
+    let locks = store::locked_note_refs(conn, account_str, Some(run_id))?;
     let mut reserved: BTreeSet<ReceivedNoteId> = BTreeSet::new();
     for t in transfers {
         let request = self_payment_request(db, network, account, u64::from(t.amount))?;
@@ -465,7 +466,8 @@ pub(crate) fn sign_schedule<P: Parameters>(
 /// wallet's V2 notes and fan the value into one **same-address change output** per planned
 /// denomination. Change outputs are the one operation the post-NU6.3 cross-address restriction
 /// sanctions for retaining V2 value, so the split stays in the Orchard pool on the current
-/// (`OrchardPostNu6_3`) circuit. Stored note values are the residual-adjusted ones actually built.
+/// (`OrchardPostNu6_3`) circuit. Stored notes carry the residual-adjusted values at their real
+/// (shuffled) action indices, so the `(txid, output_index)` refs match what the scanner stores.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sign_split<P: Parameters>(
     db: &mut Db<P>,
@@ -477,8 +479,9 @@ pub(crate) fn sign_split<P: Parameters>(
     account_str: &str,
     outputs: &[u64],
 ) -> Result<SignedPczt, MigrationError> {
-    let locks = store::locked_note_refs(conn, account_str)?;
-    let (pczt, adjusted_outputs) =
+    // Exclude this run's own (not-yet-existing) notes for symmetry; other live runs' stay locked.
+    let locks = store::locked_note_refs(conn, account_str, Some(run_id))?;
+    let (pczt, placed_outputs) =
         crate::split::build_split_pczt(db, network, account, usk, &locks, outputs)?;
     let signed = prove_sign_finalize(pczt, usk)?;
     store::insert_prep_tx(
@@ -488,12 +491,11 @@ pub(crate) fn sign_split<P: Parameters>(
         &signed.raw_pczt,
         "pending",
     )?;
-    let prepared: Vec<store::PreparedNote> = adjusted_outputs
+    let prepared: Vec<store::PreparedNote> = placed_outputs
         .iter()
-        .enumerate()
-        .map(|(i, &value_zatoshi)| store::PreparedNote {
+        .map(|&(action_index, value_zatoshi)| store::PreparedNote {
             txid_hex: signed.txid.to_string(),
-            output_index: i as u32,
+            output_index: action_index,
             value_zatoshi,
             note_version: 2,
             nullifier_hex: None,

@@ -115,7 +115,8 @@ pub(crate) fn adjust_outputs_for_exact_balance(
 /// Build the note-split transaction as an unproven PCZT: spend every spendable V2 note and fan the
 /// value into one same-address change output per planned denomination. Runs entirely on public
 /// fork APIs (the fork's `create_pczt_from_proposal` cannot keep V6 Orchard outputs in the V2
-/// pool). Returns the PCZT and the residual-adjusted output values actually used.
+/// pool). Returns the PCZT plus, per requested change output, its `(action_index, value)` — the
+/// residual-adjusted value at the output's real (shuffled) action position within the transaction.
 ///
 /// The bundle is `OrchardPostNu6_3` (current circuit): `Builder::new` derives the protocol from
 /// the target height's consensus branch, and `build_for_pczt` selects `V6` because that builder is
@@ -129,7 +130,7 @@ pub(crate) fn build_split_pczt<P: Parameters>(
     usk: &UnifiedSpendingKey,
     migration_locks: &BTreeSet<(String, u32)>,
     outputs: &[u64],
-) -> Result<(pczt::Pczt, Vec<u64>), MigrationError> {
+) -> Result<(pczt::Pczt, Vec<(u32, u64)>), MigrationError> {
     // --- immutable phase: select the notes to consolidate ---
     let notes = select_spendable_v2_notes(db, account, migration_locks)?;
     if notes.is_empty() {
@@ -205,6 +206,26 @@ pub(crate) fn build_split_pczt<P: Parameters>(
         .build_for_pczt(OsRng, &Zip317FeeRule::standard())
         .map_err(|e| MigrationError::Pipeline(format!("note split: build: {e:?}")))?;
 
+    // The orchard builder SHUFFLES action positions; the wallet scanner stores each received note
+    // under its action index within the transaction. Map every change output (request order) to its
+    // real action index via the build metadata — persisting request-order indices would make the
+    // stored (txid, output_index) refs point at the wrong notes.
+    let placed: Vec<(u32, u64)> = adjusted
+        .iter()
+        .enumerate()
+        .map(|(i, &value)| {
+            build_result
+                .orchard_meta
+                .output_action_index(i)
+                .map(|action_index| (action_index as u32, value))
+                .ok_or_else(|| {
+                    MigrationError::Pipeline(format!(
+                        "note split: no action index for change output {i}"
+                    ))
+                })
+        })
+        .collect::<Result<_, _>>()?;
+
     // --- assemble the PCZT (Creator → IoFinalizer), mirroring the fork's create_pczt tail ---
     let created = pczt::roles::creator::Creator::build_from_parts(build_result.pczt_parts)
         .ok_or_else(|| MigrationError::Pipeline("note split: pczt creation failed".into()))?;
@@ -212,7 +233,7 @@ pub(crate) fn build_split_pczt<P: Parameters>(
         .finalize_io()
         .map_err(|e| MigrationError::Pipeline(format!("note split: io finalize: {e:?}")))?;
 
-    Ok((finalized, adjusted))
+    Ok((finalized, placed))
 }
 
 #[cfg(test)]

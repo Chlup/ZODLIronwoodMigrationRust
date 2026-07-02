@@ -289,19 +289,26 @@ pub(crate) fn insert_prepared_notes(
     Ok(())
 }
 
+/// Locked prepared-note refs of the account's live (non-terminal) runs, excluding `exclude_run_id`
+/// when given. A run's own operations pass their run id: the schedule transfers must SPEND the notes
+/// the run's split prepared (locks exist to keep *other* migration operations off them), and the
+/// split itself predates its notes. Nothing ever unlocks a note; runs release theirs by reaching a
+/// terminal phase.
 pub(crate) fn locked_note_refs(
     conn: &Connection,
     account_uuid: &str,
+    exclude_run_id: Option<&str>,
 ) -> rusqlite::Result<BTreeSet<(String, u32)>> {
     let sql = format!(
         "SELECT lower(pn.txid_hex), pn.output_index
          FROM ext_ironwood_migration_prepared_notes pn
          INNER JOIN ext_ironwood_migration_runs r ON r.run_id = pn.run_id
-         WHERE r.account_uuid = ?1 AND pn.lock_state = 'locked' AND r.phase NOT IN ({})",
+         WHERE r.account_uuid = ?1 AND pn.lock_state = 'locked' AND r.phase NOT IN ({})
+           AND (?2 IS NULL OR pn.run_id <> ?2)",
         terminal_in_clause()
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![account_uuid], |row| {
+    let rows = stmt.query_map(params![account_uuid, exclude_run_id], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
     })?;
     rows.collect()
@@ -572,7 +579,7 @@ mod tests {
             &[note("AABB", 0, "locked"), note("CCDD", 2, "unlocked")],
         )
         .unwrap();
-        let refs = locked_note_refs(&conn, "acct").unwrap();
+        let refs = locked_note_refs(&conn, "acct", None).unwrap();
         assert!(refs.contains(&("aabb".to_string(), 0)));
         assert!(!refs.contains(&("ccdd".to_string(), 2)));
     }
@@ -582,7 +589,22 @@ mod tests {
         let conn = db();
         sample_run(&conn, "done", Phase::Complete);
         insert_prepared_notes(&conn, "done", &[note("AABB", 0, "locked")]).unwrap();
-        assert!(locked_note_refs(&conn, "acct").unwrap().is_empty());
+        assert!(locked_note_refs(&conn, "acct", None).unwrap().is_empty());
+    }
+
+    // Regression: a run's own locked notes must not be excluded from its own operations — the
+    // schedule transfers spend exactly the notes the split prepared. Other live runs' notes stay
+    // locked.
+    #[test]
+    fn locked_note_refs_excludes_the_callers_own_run() {
+        let conn = db();
+        sample_run(&conn, "mine", Phase::ReadyToMigrate);
+        sample_run(&conn, "other", Phase::BroadcastScheduled);
+        insert_prepared_notes(&conn, "mine", &[note("AABB", 0, "locked")]).unwrap();
+        insert_prepared_notes(&conn, "other", &[note("CCDD", 1, "locked")]).unwrap();
+        let refs = locked_note_refs(&conn, "acct", Some("mine")).unwrap();
+        assert!(!refs.contains(&("aabb".to_string(), 0)));
+        assert!(refs.contains(&("ccdd".to_string(), 1)));
     }
 
     #[test]
