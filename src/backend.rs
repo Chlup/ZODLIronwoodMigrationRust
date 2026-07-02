@@ -144,6 +144,19 @@ fn orchard_proving_key() -> &'static orchard::circuit::ProvingKey {
     })
 }
 
+/// Proving key for the **legacy** Orchard bundle used by the `V5` note split. A `V5` transaction
+/// carries an `OrchardPreNu6_3` bundle (the `FixedPostNu6_2` circuit), which is a *different* circuit
+/// from the `PostNu6_3` one the `V6` migration transfers use — proving it with the wrong key yields
+/// `Orchard(InvalidProof)` at extraction.
+fn legacy_orchard_proving_key() -> &'static orchard::circuit::ProvingKey {
+    static PK: OnceLock<orchard::circuit::ProvingKey> = OnceLock::new();
+    PK.get_or_init(|| {
+        orchard::circuit::ProvingKey::build(
+            orchard::BundleProtocol::OrchardPreNu6_3.circuit_version(),
+        )
+    })
+}
+
 fn ironwood_proving_key() -> &'static orchard::circuit::ProvingKey {
     static PK: OnceLock<orchard::circuit::ProvingKey> = OnceLock::new();
     PK.get_or_init(|| {
@@ -311,11 +324,18 @@ pub(crate) fn build_signed_pczt<P: Parameters>(
     )
     .map_err(|e| MigrationError::Pipeline(format!("create pczt: {e:?}")))?;
 
-    // 2. Prove each bundle that requires it.
+    // 2. Prove each bundle that requires it. The `V5` note split carries a legacy Orchard bundle
+    // (OrchardPreNu6_3 / FixedPostNu6_2 circuit), a different circuit than the `V6` migration
+    // transfers' Orchard (V2 spend) bundle (PostNu6_3), so it must be proved with the matching key.
+    let orchard_pk = if matches!(tx_version, TxVersion::V5) {
+        legacy_orchard_proving_key()
+    } else {
+        orchard_proving_key()
+    };
     let mut prover = pczt::roles::prover::Prover::new(pczt);
     if prover.requires_orchard_proof() {
         prover = prover
-            .create_orchard_proof(orchard_proving_key())
+            .create_orchard_proof(orchard_pk)
             .map_err(|e| MigrationError::Pipeline(format!("orchard proof: {e:?}")))?;
     }
     if prover.requires_ironwood_proof() {
