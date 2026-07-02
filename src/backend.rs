@@ -132,7 +132,8 @@ pub(crate) fn target_and_anchor<P: Parameters>(db: &Db<P>) -> Result<(u32, u32),
 
 // ======================== Proving keys ========================
 // Built once per process (in-memory; no 50 MB params). The migration transaction carries an Orchard
-// (V2 spend) bundle and an Ironwood (V3 output) bundle, each proved with its own circuit. The exact
+// (V2 spend) bundle and an Ironwood (V3 output) bundle, each proved with its own circuit; the note
+// split carries only an Orchard bundle and proves it with the same `OrchardPostNu6_3` key. The exact
 // circuit-version pairing must be confirmed at runtime against a synced wallet.
 
 fn orchard_proving_key() -> &'static orchard::circuit::ProvingKey {
@@ -140,19 +141,6 @@ fn orchard_proving_key() -> &'static orchard::circuit::ProvingKey {
     PK.get_or_init(|| {
         orchard::circuit::ProvingKey::build(
             orchard::BundleProtocol::OrchardPostNu6_3.circuit_version(),
-        )
-    })
-}
-
-/// Proving key for the **legacy** Orchard bundle used by the `V5` note split. A `V5` transaction
-/// carries an `OrchardPreNu6_3` bundle (the `FixedPostNu6_2` circuit), which is a *different* circuit
-/// from the `PostNu6_3` one the `V6` migration transfers use — proving it with the wrong key yields
-/// `Orchard(InvalidProof)` at extraction.
-fn legacy_orchard_proving_key() -> &'static orchard::circuit::ProvingKey {
-    static PK: OnceLock<orchard::circuit::ProvingKey> = OnceLock::new();
-    PK.get_or_init(|| {
-        orchard::circuit::ProvingKey::build(
-            orchard::BundleProtocol::OrchardPreNu6_3.circuit_version(),
         )
     })
 }
@@ -180,36 +168,20 @@ pub(crate) fn propose_migration_transfer<'a, P: Parameters>(
     migration_locks: &'a BTreeSet<(String, u32)>,
     target_height: TargetHeight,
     anchor: BlockHeight,
-    // `V6` crosses into Ironwood (migration transfers); `V5` keeps outputs in the legacy Orchard
-    // pool (the note split), per the fork's `orchard_outputs_to_ironwood` rule.
-    tx_version: TxVersion,
 ) -> Result<Proposal<Zip317FeeRule, ReceivedNoteId>, MigrationError> {
     let reserved_db = ReservedInputSource {
         inner: db,
         reserved,
         migration_locks,
     };
-    let change_strategy = {
-        let base =
-            MultiOutputChangeStrategy::<Zip317FeeRule, ReservedInputSource<'a, Db<P>>>::new(
-                Zip317FeeRule::standard(),
-                None,
-                ShieldedProtocol::Orchard,
-                DustOutputPolicy::default(),
-                SplitPolicy::single_output(),
-            );
-        // A `V5` (note split) transaction keeps its Orchard outputs in the legacy pre-NU6.3 pool,
-        // where each spend/output takes its own action (cross-address disabled). Without this flag
-        // the change strategy assumes post-NU6.3 Ironwood outputs (cross-address `max`), so its fee
-        // estimate disagrees with the V5 build and the builder rejects the leftover as
-        // `ChangeRequired`. `V6` migration transfers legitimately cross into Ironwood, so they keep
-        // the default.
-        if matches!(tx_version, TxVersion::V5) {
-            base.with_legacy_orchard_change()
-        } else {
-            base
-        }
-    };
+    let change_strategy =
+        MultiOutputChangeStrategy::<Zip317FeeRule, ReservedInputSource<'a, Db<P>>>::new(
+            Zip317FeeRule::standard(),
+            None,
+            ShieldedProtocol::Orchard,
+            DustOutputPolicy::default(),
+            SplitPolicy::single_output(),
+        );
     let input_selector = GreedyInputSelector::<ReservedInputSource<'a, Db<P>>>::new();
     input_selector
         .propose_transaction(
@@ -221,7 +193,7 @@ pub(crate) fn propose_migration_transfer<'a, P: Parameters>(
             account,
             request,
             &change_strategy,
-            Some(tx_version),
+            Some(TxVersion::V6),
         )
         .map_err(|e| MigrationError::Pipeline(format!("propose migration transfer: {e}")))
 }
@@ -293,20 +265,17 @@ pub(crate) fn sweep_crossing_value<P: Parameters>(
     Ok(total.checked_sub(fee).filter(|crossing| *crossing > 0))
 }
 
-/// Drive the full PCZT pipeline for a proposal: create the PCZT at `tx_version`, prove the Orchard
-/// (and, at V6, Ironwood) bundles, software-sign every Orchard spend with the USK's
-/// spend-authorizing key, and serialize. Returns the serialized signed PCZT plus the extracted
-/// transaction id. `V6` migration transfers force an Ironwood output; `V5` (the note split) keeps
-/// outputs in the legacy Orchard pool and carries no Ironwood bundle to prove.
+/// Drive the full PCZT pipeline for a proposal: create the PCZT at V6, then prove, sign, and
+/// serialize. Migration transfers cross Orchard-destined outputs into Ironwood per the fork's
+/// `orchard_outputs_to_ironwood` rule; the note split does NOT go through here (see
+/// `split::build_split_pczt`).
 pub(crate) fn build_signed_pczt<P: Parameters>(
     db: &mut Db<P>,
     network: &P,
     account: AccountUuid,
     usk: &UnifiedSpendingKey,
     proposal: &Proposal<Zip317FeeRule, ReceivedNoteId>,
-    tx_version: TxVersion,
 ) -> Result<SignedPczt, MigrationError> {
-    // 1. Create the PCZT (V6 forces the Ironwood output; V5 stays in Orchard).
     let pczt = create_pczt_from_proposal_with_tx_version::<
         _,
         _,
@@ -320,22 +289,25 @@ pub(crate) fn build_signed_pczt<P: Parameters>(
         account,
         OvkPolicy::Sender,
         proposal,
-        tx_version,
+        TxVersion::V6,
     )
     .map_err(|e| MigrationError::Pipeline(format!("create pczt: {e:?}")))?;
+    prove_sign_finalize(pczt, usk)
+}
 
-    // 2. Prove each bundle that requires it. The `V5` note split carries a legacy Orchard bundle
-    // (OrchardPreNu6_3 / FixedPostNu6_2 circuit), a different circuit than the `V6` migration
-    // transfers' Orchard (V2 spend) bundle (PostNu6_3), so it must be proved with the matching key.
-    let orchard_pk = if matches!(tx_version, TxVersion::V5) {
-        legacy_orchard_proving_key()
-    } else {
-        orchard_proving_key()
-    };
+/// Prove, sign, finalize, and serialize an assembled PCZT. Shared by the migration transfers
+/// (whose PCZT comes from the fork's `create_pczt_from_proposal_with_tx_version`) and the note
+/// split (whose PCZT comes from `split::build_split_pczt`). The Orchard bundle is
+/// `OrchardPostNu6_3` in both cases, so one proving key serves; the Ironwood proof only runs when
+/// the PCZT carries an Ironwood bundle (migration transfers).
+pub(crate) fn prove_sign_finalize(
+    pczt: pczt::Pczt,
+    usk: &UnifiedSpendingKey,
+) -> Result<SignedPczt, MigrationError> {
     let mut prover = pczt::roles::prover::Prover::new(pczt);
     if prover.requires_orchard_proof() {
         prover = prover
-            .create_orchard_proof(orchard_pk)
+            .create_orchard_proof(orchard_proving_key())
             .map_err(|e| MigrationError::Pipeline(format!("orchard proof: {e:?}")))?;
     }
     if prover.requires_ironwood_proof() {
@@ -345,8 +317,9 @@ pub(crate) fn build_signed_pczt<P: Parameters>(
     }
     let pczt = prover.finish();
 
-    // 3. Sign every Orchard spend that is ours. Action positions are randomized (qleak), so we try
-    // every index and ignore wrong-key actions, terminating on InvalidIndex (the fork's own pattern).
+    // Sign every Orchard spend that is ours — including the note split's fabricated zero-value
+    // change-spends, which are wallet-controlled. Action positions are randomized (qleak), so we
+    // try every index and ignore wrong-key actions, terminating on InvalidIndex.
     let mut signer = pczt::roles::signer::Signer::new(pczt)
         .map_err(|e| MigrationError::Pipeline(format!("pczt signer init: {e:?}")))?;
     let ask = orchard::keys::SpendAuthorizingKey::from(usk.orchard());
@@ -362,7 +335,6 @@ pub(crate) fn build_signed_pczt<P: Parameters>(
     }
     let pczt = signer.finish();
 
-    // 4. Finalize spends and serialize; extract once to obtain the txid.
     let pczt = pczt::roles::spend_finalizer::SpendFinalizer::new(pczt)
         .finalize_spends()
         .map_err(|e| MigrationError::Pipeline(format!("finalize spends: {e:?}")))?;
@@ -423,43 +395,6 @@ fn self_payment_request<P: Parameters>(
     build_self_payment(&address, amount)
 }
 
-/// Build a zip321 request paying each of `amounts` (zatoshi) to `address` as a **separate** output.
-/// Used by the note split, which fans one Orchard note into several self-notes (each payment index
-/// becomes its own output, even when the address/amount repeat).
-fn build_self_payment_multi(
-    address: &ZcashAddress,
-    amounts: &[u64],
-) -> Result<TransactionRequest, MigrationError> {
-    let payments = amounts
-        .iter()
-        .map(|&amount| {
-            let value = Zatoshis::from_u64(amount)
-                .map_err(|e| MigrationError::Pipeline(format!("invalid split amount: {e:?}")))?;
-            Ok(Payment::without_memo(address.clone(), value))
-        })
-        .collect::<Result<Vec<_>, MigrationError>>()?;
-    TransactionRequest::new(payments)
-        .map_err(|e| MigrationError::Pipeline(format!("construct split request: {e:?}")))
-}
-
-/// Multi-output variant of [`self_payment_request`]: one self-payment per entry in `amounts`.
-fn self_payment_request_multi<P: Parameters>(
-    db: &Db<P>,
-    network: &P,
-    account: AccountUuid,
-    amounts: &[u64],
-) -> Result<TransactionRequest, MigrationError> {
-    let address = db
-        .get_last_generated_address_matching(account, UnifiedAddressRequest::AllAvailableKeys)?
-        .ok_or(MigrationError::InvalidState(
-            crate::error::InvalidStateError::NotApplicable(
-                "account has no current unified address",
-            ),
-        ))?
-        .to_zcash_address(network.network_type());
-    build_self_payment_multi(&address, amounts)
-}
-
 /// The note references a proposal selected as inputs, so successive transfers can reserve them.
 fn proposal_note_refs(proposal: &Proposal<Zip317FeeRule, ReceivedNoteId>) -> Vec<ReceivedNoteId> {
     proposal
@@ -518,17 +453,19 @@ pub(crate) fn sign_schedule<P: Parameters>(
             &locks,
             target,
             BlockHeight::from(t.anchor_height),
-            TxVersion::V6,
         )?;
         reserved.extend(proposal_note_refs(&proposal));
-        let signed = build_signed_pczt(db, network, account, usk, &proposal, TxVersion::V6)?;
+        let signed = build_signed_pczt(db, network, account, usk, &proposal)?;
         store::insert_pending_txs(conn, run_id, &[pending_row(t, &signed)])?;
     }
     Ok(())
 }
 
-/// Build, sign (as a PCZT), and persist the note-split (denomination prep) transaction: one
-/// self-send creating the planned output denominations.
+/// Build, sign (as a PCZT), and persist the note-split (denomination prep) transaction: spend the
+/// wallet's V2 notes and fan the value into one **same-address change output** per planned
+/// denomination. Change outputs are the one operation the post-NU6.3 cross-address restriction
+/// sanctions for retaining V2 value, so the split stays in the Orchard pool on the current
+/// (`OrchardPostNu6_3`) circuit. Stored note values are the residual-adjusted ones actually built.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sign_split<P: Parameters>(
     db: &mut Db<P>,
@@ -540,27 +477,10 @@ pub(crate) fn sign_split<P: Parameters>(
     account_str: &str,
     outputs: &[u64],
 ) -> Result<SignedPczt, MigrationError> {
-    let (target, natural_anchor) = db
-        .get_target_and_anchor_heights(ConfirmationsPolicy::default().trusted())?
-        .ok_or(MigrationError::NotSynced)?;
     let locks = store::locked_note_refs(conn, account_str)?;
-    let reserved: BTreeSet<ReceivedNoteId> = BTreeSet::new();
-    // Fan the Orchard balance into one self-note per denomination, and STAY in Orchard: `V5` keeps
-    // the outputs as legacy Orchard (V2) notes instead of crossing the turnstile into Ironwood (that
-    // is the migration transfers' job). `outputs` are the self-funding note values.
-    let request = self_payment_request_multi(db, network, account, outputs)?;
-    let proposal = propose_migration_transfer(
-        db,
-        network,
-        account,
-        request,
-        &reserved,
-        &locks,
-        target,
-        natural_anchor,
-        TxVersion::V5,
-    )?;
-    let signed = build_signed_pczt(db, network, account, usk, &proposal, TxVersion::V5)?;
+    let (pczt, adjusted_outputs) =
+        crate::split::build_split_pczt(db, network, account, usk, &locks, outputs)?;
+    let signed = prove_sign_finalize(pczt, usk)?;
     store::insert_prep_tx(
         conn,
         run_id,
@@ -568,7 +488,7 @@ pub(crate) fn sign_split<P: Parameters>(
         &signed.raw_pczt,
         "pending",
     )?;
-    let prepared: Vec<store::PreparedNote> = outputs
+    let prepared: Vec<store::PreparedNote> = adjusted_outputs
         .iter()
         .enumerate()
         .map(|(i, &value_zatoshi)| store::PreparedNote {

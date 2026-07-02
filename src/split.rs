@@ -122,8 +122,6 @@ pub(crate) fn adjust_outputs_for_exact_balance(
 /// in use. Change outputs are sanctioned under the cross-address restriction — the orchard builder
 /// pairs each with a fabricated zero-value spend at the change's own address, signed by the normal
 /// signing flow with the wallet's spend-authorizing key.
-// Wired into sign_split by the follow-up commit; the allow keeps this commit warning-clean.
-#[allow(dead_code)]
 pub(crate) fn build_split_pczt<P: Parameters>(
     db: &mut Db<P>,
     network: &P,
