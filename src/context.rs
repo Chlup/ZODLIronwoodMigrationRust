@@ -121,9 +121,17 @@ impl<P: Parameters + Clone> MigrationContext<P> {
         ) {
             if let Some(prep) = store::prep_tx(&conn, &run.run_id)? {
                 let db = self.open_wallet()?;
+                // Mined alone is not enough: the split's change notes must also be SPENDABLE
+                // (enough confirmations for the balance policy). Advancing on mined-only let the
+                // subsequent propose run against a still-zero balance and produce an empty schedule.
                 if backend::is_tx_mined(&db, &prep.txid_hex)? {
-                    store::set_phase(&conn, &run.run_id, Phase::ReadyToMigrate, None)?;
-                    return Ok(MigrationState::ReadyToPropose);
+                    let spendable =
+                        backend::pool_balances(&db, backend::account_uuid(self.account_uuid))?
+                            .orchard_spendable;
+                    if spendable > 0 {
+                        store::set_phase(&conn, &run.run_id, Phase::ReadyToMigrate, None)?;
+                        return Ok(MigrationState::ReadyToPropose);
+                    }
                 }
             }
         }
@@ -307,6 +315,13 @@ impl<P: Parameters + Clone> MigrationContext<P> {
         schedule: &MigrationSchedule,
         usk: &[u8],
     ) -> Result<(), MigrationError> {
+        // Refuse an empty schedule outright: signing it would advance the run into the
+        // post-schedule phases with nothing queued, which reads as an invalid migration.
+        if schedule.transfers.is_empty() {
+            return Err(MigrationError::InvalidState(
+                InvalidStateError::NotApplicable("cannot sign an empty schedule"),
+            ));
+        }
         let parsed = backend::parse_usk(usk)?;
         let conn = self.store_conn()?;
         let run_id = match self.active_run(&conn)? {
