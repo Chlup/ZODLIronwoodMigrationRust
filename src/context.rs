@@ -197,19 +197,22 @@ impl<P: Parameters + Clone> MigrationContext<P> {
     /// actions); at signing time the last output absorbs any drift between this plan and the
     /// then-current balance.
     pub fn prepare_note_split(&self) -> Result<NoteSplitProposal, MigrationError> {
-        let total = self.orchard_spendable()?;
+        let db = self.open_wallet()?;
+        let account = backend::account_uuid(self.account_uuid);
+        let total = backend::pool_balances(&db, account)?
+            .orchard_spendable;
         let plan =
             plan_denominations(total, FEE_ESTIMATE_ZATOSHI).map_err(MigrationError::Pipeline)?;
         // Pre-split there are no migration locks yet, so no exclusions apply.
-        let db = self.open_wallet()?;
         let locks = std::collections::BTreeSet::new();
         let n_spends =
-            crate::split::select_spendable_v2_notes(&db, backend::account_uuid(self.account_uuid), &locks)?
+            crate::split::select_spendable_v2_notes(&db, account, &locks)?
                 .len()
                 .max(1);
+        let n_outputs = plan.migration_outputs.len();
         Ok(NoteSplitProposal {
-            output_notes: plan.migration_outputs.clone(),
-            fee: crate::split::split_fee(n_spends, plan.migration_outputs.len()),
+            output_notes: plan.migration_outputs,
+            fee: crate::split::split_fee(n_spends, n_outputs),
         })
     }
 
