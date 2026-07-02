@@ -35,29 +35,32 @@ serde_json = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
 hex = "0.4"
 # zcash_protocol is REQUIRED: the public API uses its canonical Network/Zatoshis/BlockHeight types.
-# Pinned to the same fork+branch as the backend crates so the direct and transitive zcash_protocol
-# resolve to a single crate.
-zcash_protocol = { version = "0.9", git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts" }
+# Pinned to the same git source+branch as the backend crates so the direct and transitive
+# zcash_protocol resolve to a single crate.
+zcash_protocol = { version = "0.10.0-pre.0", git = "https://github.com/zcash/librustzcash", rev = "eb828caadb4b2be4a39823f95e50b42731a515f5" }
 
-# ----- backend (optional): the valargroup librustzcash fork -----
-# All librustzcash crates are pinned by rev (reproducible); they share one git source so they
-# unify. orchard is pinned by the SAME branch spec the valargroup workspace uses
-# (`orchard.workspace = true` -> branch), so the direct dep and the transitive dep resolve to a
-# single orchard (a `rev` spec would not unify with the workspace's `branch` spec).
+# ----- backend (optional): upstream zcash/librustzcash -----
+# The valargroup qleak PRs have been merged upstream, so track zcash/librustzcash directly. Pinned
+# by rev (eb828ca, main HEAD at migration time) for reproducibility; all librustzcash crates share
+# one git source+rev so they unify to a single copy of each crate. orchard is a crates.io dep
+# matching that rev's workspace; the direct dep and the transitive dep resolve to a single orchard.
 # The Ironwood APIs are gated `#[cfg(zcash_unstable = "nu6.3")]`; the cfg is set in
 # .cargo/config.toml. `unstable` exposes the `proposed_version` parameter used to force V6.
-zcash_client_backend = { version = "0.23", git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts", features = ["orchard", "transparent-inputs", "unstable", "pczt"], optional = true }
-zcash_client_sqlite = { version = "0.21", git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts", features = ["orchard", "transparent-inputs", "unstable", "serde"], optional = true }
-zcash_primitives = { version = "0.28", git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts", optional = true }
-zcash_keys = { version = "0.14", git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts", features = ["orchard"], optional = true }
-zcash_address = { version = "0.12", git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts", optional = true }
-zcash_transparent = { version = "0.8", git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts", optional = true }
-zip321 = { version = "0.8", git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts", optional = true }
-zcash_proofs = { version = "0.28", git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts", optional = true }
+zcash_client_backend = { version = "0.23.0", git = "https://github.com/zcash/librustzcash", rev = "eb828caadb4b2be4a39823f95e50b42731a515f5", features = ["orchard", "transparent-inputs", "unstable", "pczt"], optional = true }
+zcash_client_sqlite = { version = "0.21.1", git = "https://github.com/zcash/librustzcash", rev = "eb828caadb4b2be4a39823f95e50b42731a515f5", features = ["orchard", "transparent-inputs", "unstable", "serde"], optional = true }
+zcash_primitives = { version = "0.29.0-pre.0", git = "https://github.com/zcash/librustzcash", rev = "eb828caadb4b2be4a39823f95e50b42731a515f5", optional = true }
+zcash_keys = { version = "0.15.0-pre.0", git = "https://github.com/zcash/librustzcash", rev = "eb828caadb4b2be4a39823f95e50b42731a515f5", features = ["orchard"], optional = true }
+zcash_address = { version = "0.13.0-pre.0", git = "https://github.com/zcash/librustzcash", rev = "eb828caadb4b2be4a39823f95e50b42731a515f5", optional = true }
+zcash_transparent = { version = "0.9.0-pre.0", git = "https://github.com/zcash/librustzcash", rev = "eb828caadb4b2be4a39823f95e50b42731a515f5", optional = true }
+zip321 = { version = "0.8.0", git = "https://github.com/zcash/librustzcash", rev = "eb828caadb4b2be4a39823f95e50b42731a515f5", optional = true }
+zcash_proofs = { version = "0.29.0-pre.0", git = "https://github.com/zcash/librustzcash", rev = "eb828caadb4b2be4a39823f95e50b42731a515f5", optional = true }
 # pczt: the crate persists/signs migration txs as PCZTs (issue #1). Role features mirror what
 # zcash_client_backend's `pczt` feature enables, plus `orchard`.
-pczt = { version = "0.7", git = "https://github.com/valargroup/librustzcash", branch = "adam/qleak-pr44-orchard-dummy-ciphertexts", default-features = false, features = ["orchard", "io-finalizer", "prover", "signer", "spend-finalizer", "tx-extractor", "zcp-builder"], optional = true }
-orchard = { version = "0.14", git = "https://github.com/zcash/orchard", branch = "adam/qleak-dummy-ciphertexts-on-pr505", default-features = false, features = ["circuit"], optional = true }
+pczt = { version = "0.7.0", git = "https://github.com/zcash/librustzcash", rev = "eb828caadb4b2be4a39823f95e50b42731a515f5", default-features = false, features = ["orchard", "io-finalizer", "prover", "signer", "spend-finalizer", "tx-extractor", "zcp-builder"], optional = true }
+# orchard is a plain crates.io dep matching upstream librustzcash main (workspace uses
+# 0.15.0-pre.1); this unifies the direct dep with the transitive dep to a single orchard.
+orchard = { version = "0.15.0-pre.1", default-features = false, features = ["circuit"], optional = true }
+shardtree = { version = "0.6.2", optional = true }
 rand = { version = "0.8", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
 

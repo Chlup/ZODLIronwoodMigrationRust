@@ -62,6 +62,10 @@ pub enum MigrationError {
     /// are heterogeneous and share no single common type.
     #[cfg(feature = "librustzcash-backend")]
     Pipeline(String),
+    /// A capability the engine relies on is not yet available in the pinned librustzcash. Currently
+    /// used for the Ironwood balance read: upstream (eb828ca) leaves Ironwood pool/note tracking as
+    /// `todo!()`, so the wallet cannot report an Ironwood balance yet.
+    Unsupported(&'static str),
 }
 
 impl MigrationError {
@@ -76,6 +80,7 @@ impl MigrationError {
             MigrationError::Backend(_) => 5,
             #[cfg(feature = "librustzcash-backend")]
             MigrationError::Pipeline(_) => 6,
+            MigrationError::Unsupported(_) => 7,
         }
     }
 }
@@ -96,6 +101,9 @@ impl fmt::Display for MigrationError {
             MigrationError::Backend(e) => write!(f, "wallet backend error: {e}"),
             #[cfg(feature = "librustzcash-backend")]
             MigrationError::Pipeline(e) => write!(f, "pczt pipeline error: {e}"),
+            MigrationError::Unsupported(why) => {
+                write!(f, "unsupported by pinned librustzcash: {why}")
+            }
         }
     }
 }

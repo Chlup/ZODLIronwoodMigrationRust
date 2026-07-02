@@ -109,13 +109,16 @@ impl MigrationContext {
             .filter(|_| matches!(phase, Phase::FailedRecoverable | Phase::FailedTerminal));
         let mapped = state::to_state(phase, progress, attention);
         // Completion: an in-progress run whose transfers are all confirmed, with the Orchard
-        // balance fully migrated into Ironwood.
+        // balance fully migrated into Ironwood. The Ironwood balance read is not yet supported by
+        // the pinned librustzcash (see `backend::ironwood_total`), so this returns
+        // `MigrationError::Unsupported` at the finish line until upstream lands Ironwood tracking.
         if let MigrationState::InProgress(p) = &mapped {
             if p.total_transfers > 0 && p.completed_transfers == p.total_transfers {
                 let db = self.open_wallet()?;
-                let balances =
-                    backend::pool_balances(&db, backend::account_uuid(self.account_uuid))?;
-                if balances.orchard_spendable == 0 && balances.ironwood_total > 0 {
+                let account = backend::account_uuid(self.account_uuid);
+                let orchard_spendable = backend::pool_balances(&db, account)?.orchard_spendable;
+                let ironwood_total = backend::ironwood_total(&db, account)?;
+                if orchard_spendable == 0 && ironwood_total > 0 {
                     return Ok(MigrationState::Complete);
                 }
             }

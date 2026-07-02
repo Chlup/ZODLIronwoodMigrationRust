@@ -1,15 +1,17 @@
 // Portions ported from vizor-wallet `rust/src/wallet/sync/send.rs`
 // (origin/adam/qleak-pr73-orchard-librustzcash), © Chainapsis, Apache-2.0.
 
-//! Backend integration against the valargroup librustzcash fork: opening the wallet database,
-//! resolving accounts and spending keys, reading Orchard/Ironwood balances and chain heights, and
-//! building migration transactions as **PCZTs** (issue #1): propose → create-PCZT(V6) → prove →
-//! sign → serialize. The crate persists the serialized PCZT; the platform extracts the consensus
-//! transaction (one call) and broadcasts it.
+//! Backend integration against upstream zcash/librustzcash (the valargroup qleak PRs are now
+//! merged; pinned by rev in Cargo.toml): opening the wallet database, resolving accounts and
+//! spending keys, reading the Orchard balance and chain heights, and building migration
+//! transactions as **PCZTs** (issue #1): propose -> create-PCZT(V6) -> prove -> sign -> serialize.
+//! The crate persists the serialized PCZT; the platform extracts the consensus transaction (one
+//! call) and broadcasts it.
 //!
-//! Compile-verified against the real valargroup APIs. Exercising the pipeline against live data
-//! requires a synced wallet database (a documented integration gap); the proving-key circuit-version
-//! pairing must likewise be confirmed at runtime.
+//! Compile-verified against the upstream APIs. Exercising the pipeline against live data requires a
+//! synced wallet database (a documented integration gap). Two upstream gaps at the pinned rev: the
+//! Ironwood balance is not yet tracked (see [`ironwood_total`]), and the Orchard/Ironwood post-NU6.3
+//! proving-key pairing must be confirmed at runtime.
 
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
@@ -19,7 +21,7 @@ use uuid::Uuid;
 use zcash_address::ZcashAddress;
 use zcash_client_backend::data_api::wallet::input_selection::{GreedyInputSelector, InputSelector};
 use zcash_client_backend::data_api::wallet::{
-    create_pczt_from_proposal_with_tx_version, ConfirmationsPolicy, TargetHeight,
+    create_pczt_from_proposal, ConfirmationsPolicy, TargetHeight,
 };
 use zcash_client_backend::data_api::WalletRead;
 use zcash_client_backend::fees::zip317::MultiOutputChangeStrategy;
@@ -33,7 +35,7 @@ use zcash_primitives::transaction::fees::zip317::FeeRule as Zip317FeeRule;
 use zcash_primitives::transaction::{TxId, TxVersion};
 use zcash_protocol::consensus::{self, BlockHeight, Parameters};
 use zcash_protocol::value::Zatoshis;
-use zcash_protocol::ShieldedProtocol;
+use zcash_protocol::ShieldedPool;
 use zip321::{Payment, TransactionRequest};
 
 use crate::error::MigrationError;
@@ -44,10 +46,10 @@ use crate::types::Network;
 /// The concrete wallet database handle the backend operates on.
 pub(crate) type Db = WalletDb<rusqlite::Connection, consensus::Network, SystemClock, OsRng>;
 
-/// Spendable Orchard balance and total Ironwood balance (zatoshi) for an account.
+/// Spendable Orchard balance (zatoshi) for an account. The Ironwood balance is read separately via
+/// [`ironwood_total`] because the pinned librustzcash does not track it yet.
 pub(crate) struct PoolBalances {
     pub orchard_spendable: u64,
-    pub ironwood_total: u64,
 }
 
 /// A signed migration transaction, carried as a serialized PCZT ready for the platform to extract
@@ -75,7 +77,7 @@ pub(crate) fn open_wallet(db_path: &str, network: Network) -> Result<Db, Migrati
         .map_err(|e| MigrationError::Pipeline(format!("open wallet: {e:?}")))
 }
 
-/// Read the spendable Orchard and total Ironwood balances for `account`.
+/// Read the spendable Orchard balance for `account`.
 pub(crate) fn pool_balances(db: &Db, account: AccountUuid) -> Result<PoolBalances, MigrationError> {
     let summary = db
         .get_wallet_summary(ConfirmationsPolicy::default())?
@@ -88,8 +90,20 @@ pub(crate) fn pool_balances(db: &Db, account: AccountUuid) -> Result<PoolBalance
         ))?;
     Ok(PoolBalances {
         orchard_spendable: u64::from(balance.orchard_balance().spendable_value()),
-        ironwood_total: u64::from(balance.ironwood_balance().total()),
     })
+}
+
+/// Read the total Ironwood balance (zatoshi) for `account`.
+///
+/// Not yet available: upstream librustzcash at the pinned rev (eb828ca) leaves Ironwood pool and
+/// note tracking as `todo!()` (`zcash_client_sqlite` balance path and `zcash_client_backend`
+/// `note_count`), and `AccountBalance` exposes no `ironwood_balance()`. Until upstream lands
+/// Ironwood accounting, this returns [`MigrationError::Unsupported`] so callers fail loudly rather
+/// than silently reading a wrong value.
+pub(crate) fn ironwood_total(_db: &Db, _account: AccountUuid) -> Result<u64, MigrationError> {
+    Err(MigrationError::Unsupported(
+        "Ironwood balance tracking is not yet implemented in the pinned librustzcash",
+    ))
 }
 
 /// Read the current target height and the wallet's natural (spendable) anchor height.
@@ -105,21 +119,22 @@ pub(crate) fn target_and_anchor(db: &Db) -> Result<(u32, u32), MigrationError> {
 // (V2 spend) bundle and an Ironwood (V3 output) bundle, each proved with its own circuit. The exact
 // circuit-version pairing must be confirmed at runtime against a synced wallet.
 
+// Upstream unified the Orchard and Ironwood circuit into a single post-NU6.3 circuit version:
+// `bundle_version_for_branch(.., ValuePool::Orchard).circuit_version()` and its Ironwood counterpart
+// both resolve to `OrchardCircuitVersion::PostNu6_3`, and the builder proves both bundles with one
+// key (see zcash_primitives::transaction::builder). We keep the two accessors so the PCZT prover's
+// `create_orchard_proof` / `create_ironwood_proof` each get a key, but they build the same circuit.
 fn orchard_proving_key() -> &'static orchard::circuit::ProvingKey {
     static PK: OnceLock<orchard::circuit::ProvingKey> = OnceLock::new();
     PK.get_or_init(|| {
-        orchard::circuit::ProvingKey::build(
-            orchard::BundleProtocol::OrchardPostNu6_3.circuit_version(),
-        )
+        orchard::circuit::ProvingKey::build(orchard::circuit::OrchardCircuitVersion::PostNu6_3)
     })
 }
 
 fn ironwood_proving_key() -> &'static orchard::circuit::ProvingKey {
     static PK: OnceLock<orchard::circuit::ProvingKey> = OnceLock::new();
     PK.get_or_init(|| {
-        orchard::circuit::ProvingKey::build(
-            orchard::BundleProtocol::IronwoodPostNu6_3.circuit_version(),
-        )
+        orchard::circuit::ProvingKey::build(orchard::circuit::OrchardCircuitVersion::PostNu6_3)
     })
 }
 
@@ -147,7 +162,7 @@ pub(crate) fn propose_migration_transfer<'a>(
         MultiOutputChangeStrategy::<Zip317FeeRule, ReservedInputSource<'a, Db>>::new(
             Zip317FeeRule::standard(),
             None,
-            ShieldedProtocol::Orchard,
+            ShieldedPool::Orchard,
             DustOutputPolicy::default(),
             SplitPolicy::single_output(),
         );
@@ -177,22 +192,17 @@ pub(crate) fn build_signed_pczt(
     usk: &UnifiedSpendingKey,
     proposal: &Proposal<Zip317FeeRule, ReceivedNoteId>,
 ) -> Result<SignedPczt, MigrationError> {
-    // 1. Create the PCZT (V6 forces the Ironwood output).
-    let pczt = create_pczt_from_proposal_with_tx_version::<
+    // 1. Create the PCZT. The target V6 version is carried by the proposal (see
+    // `propose_migration_transfer`, which passes `Some(TxVersion::V6)` to `propose_transaction`),
+    // so upstream derives it here; the explicit tx-version parameter was dropped upstream.
+    let pczt = create_pczt_from_proposal::<
         _,
         _,
         std::convert::Infallible,
         _,
         std::convert::Infallible,
         _,
-    >(
-        db,
-        network,
-        account,
-        OvkPolicy::Sender,
-        proposal,
-        TxVersion::V6,
-    )
+    >(db, network, account, OvkPolicy::Sender, proposal)
     .map_err(|e| MigrationError::Pipeline(format!("create pczt: {e:?}")))?;
 
     // 2. Prove each bundle that requires it.
@@ -230,7 +240,12 @@ pub(crate) fn build_signed_pczt(
     let pczt = pczt::roles::spend_finalizer::SpendFinalizer::new(pczt)
         .finalize_spends()
         .map_err(|e| MigrationError::Pipeline(format!("finalize spends: {e:?}")))?;
-    let raw_pczt = pczt.serialize();
+    // `Pczt::serialize` now consumes `self` and returns a `Result`; clone so we can also extract the
+    // txid from the same (finalized) PCZT below.
+    let raw_pczt = pczt
+        .clone()
+        .serialize()
+        .map_err(|e| MigrationError::Pipeline(format!("serialize pczt: {e:?}")))?;
     let tx = pczt::roles::tx_extractor::TransactionExtractor::new(pczt)
         .extract()
         .map_err(|e| MigrationError::Pipeline(format!("extract tx: {e:?}")))?;

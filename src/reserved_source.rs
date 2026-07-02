@@ -13,7 +13,7 @@ use zcash_client_backend::data_api::{
     AccountMeta, InputSource, NoteFilter, ReceivedNotes, TargetValue, TransparentOutputFilter,
 };
 use zcash_client_backend::wallet::{Note, ReceivedNote, WalletTransparentOutput};
-use zcash_protocol::{ShieldedProtocol, TxId};
+use zcash_protocol::{ShieldedPool, TxId};
 use zcash_transparent::address::TransparentAddress;
 use zcash_transparent::bundle::OutPoint;
 
@@ -61,7 +61,7 @@ impl<DbT: InputSource> InputSource for ReservedInputSource<'_, DbT> {
     fn get_spendable_note(
         &self,
         txid: &TxId,
-        protocol: ShieldedProtocol,
+        protocol: ShieldedPool,
         index: u32,
         target_height: TargetHeight,
     ) -> Result<Option<ReceivedNote<Self::NoteRef, Note>>, Self::Error> {
@@ -76,7 +76,7 @@ impl<DbT: InputSource> InputSource for ReservedInputSource<'_, DbT> {
         &self,
         account: Self::AccountId,
         target_value: TargetValue,
-        sources: &[ShieldedProtocol],
+        sources: &[ShieldedPool],
         target_height: TargetHeight,
         confirmations_policy: ConfirmationsPolicy,
         exclude: &[Self::NoteRef],
@@ -103,7 +103,7 @@ impl<DbT: InputSource> InputSource for ReservedInputSource<'_, DbT> {
     fn select_unspent_notes(
         &self,
         account: Self::AccountId,
-        sources: &[ShieldedProtocol],
+        sources: &[ShieldedPool],
         target_height: TargetHeight,
         exclude: &[Self::NoteRef],
     ) -> Result<ReceivedNotes<Self::NoteRef>, Self::Error> {
